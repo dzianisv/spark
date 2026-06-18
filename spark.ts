@@ -194,6 +194,34 @@ function pickBestModel(models: string[]): string {
   })[0]
 }
 
+// ── Utilities ────────────────────────────────────────────────────────────────
+
+function truncateOutput(output: string, max = 30_000): string {
+  if (output.length <= max) return output
+  const half = Math.floor(max / 2)
+  return output.slice(0, half) + `\n\n...(${output.length - max} characters omitted)...\n\n` + output.slice(-half)
+}
+
+function lineTrimmedMatch(content: string, find: string): { start: number; end: number } | null {
+  const contentLines = content.split("\n")
+  const findLines = find.split("\n")
+  // Remove trailing empty line from find if present
+  if (findLines[findLines.length - 1] === "") findLines.pop()
+  for (let i = 0; i <= contentLines.length - findLines.length; i++) {
+    let matches = true
+    for (let j = 0; j < findLines.length; j++) {
+      if (contentLines[i + j].trim() !== findLines[j].trim()) { matches = false; break }
+    }
+    if (matches) {
+      const before = contentLines.slice(0, i).join("\n")
+      const start = i > 0 ? before.length + 1 : 0
+      const matchedBlock = contentLines.slice(i, i + findLines.length).join("\n")
+      return { start, end: start + matchedBlock.length }
+    }
+  }
+  return null
+}
+
 // ── Tool Implementations ────────────────────────────────────────────────────
 
 function makeReadFile(): Tool {
@@ -212,6 +240,7 @@ function makeReadFile(): Tool {
             limit: { type: "number", description: "Max lines to return (default: 2000)" },
           },
           required: ["filePath"],
+          additionalProperties: false,
         },
       },
     },
@@ -243,7 +272,7 @@ function makeReadFile(): Tool {
       const total = lines.length
       const shown = slice.length
       const header = shown < total ? `(Showing lines ${offset}-${offset + shown - 1} of ${total})` : ""
-      return numbered.join("\n") + (header ? `\n${header}` : "")
+      return truncateOutput(numbered.join("\n") + (header ? `\n${header}` : ""))
     },
   }
 }
@@ -267,6 +296,7 @@ function makeWriteFile(): Tool {
             replaceAll: { type: "boolean", description: "Replace all occurrences (default: false)" },
           },
           required: ["filePath"],
+          additionalProperties: false,
         },
       },
     },
@@ -276,9 +306,9 @@ function makeWriteFile(): Tool {
 
       // Patch mode
       if (args.oldString !== undefined) {
-        const oldStr = String(args.oldString)
-        const newStr = String(args.newString ?? "")
-        const existing = await readFile(filePath, "utf-8").catch(() => null)
+        const oldStr = String(args.oldString).replace(/\r\n/g, "\n")
+        const newStr = String(args.newString ?? "").replace(/\r\n/g, "\n")
+        let existing = await readFile(filePath, "utf-8").catch(() => null)
 
         if (existing === null) {
           if (oldStr === "") {
@@ -288,6 +318,9 @@ function makeWriteFile(): Tool {
           return `Error: file not found for patching: ${filePath}`
         }
 
+        // Normalize line endings
+        existing = existing.replace(/\r\n/g, "\n")
+
         if (args.replaceAll) {
           const result = existing.replaceAll(oldStr, newStr)
           await writeFile(filePath, result, "utf-8")
@@ -295,19 +328,30 @@ function makeWriteFile(): Tool {
           return `Replaced ${count} occurrence(s) in ${filePath}`
         }
 
+        // Try exact match first
         const firstIdx = existing.indexOf(oldStr)
-        if (firstIdx === -1) return `Error: oldString not found in ${filePath}`
-        const lastIdx = existing.lastIndexOf(oldStr)
-        if (firstIdx !== lastIdx)
-          return `Error: found multiple matches for oldString. Use replaceAll or provide more context to make it unique.`
+        if (firstIdx !== -1) {
+          const lastIdx = existing.lastIndexOf(oldStr)
+          if (firstIdx !== lastIdx)
+            return `Error: found multiple matches for oldString. Use replaceAll or provide more context to make it unique.`
+          const result = existing.slice(0, firstIdx) + newStr + existing.slice(firstIdx + oldStr.length)
+          await writeFile(filePath, result, "utf-8")
+          const oldLines = oldStr.split("\n").length
+          const newLines = newStr.split("\n").length
+          return `Patched ${filePath}: replaced ${oldLines} line(s) with ${newLines} line(s)`
+        }
 
-        const result = existing.slice(0, firstIdx) + newStr + existing.slice(firstIdx + oldStr.length)
-        await writeFile(filePath, result, "utf-8")
+        // Fuzzy fallback: whitespace-insensitive line matching
+        const fuzzy = lineTrimmedMatch(existing, oldStr)
+        if (fuzzy) {
+          const result = existing.slice(0, fuzzy.start) + newStr + existing.slice(fuzzy.end)
+          await writeFile(filePath, result, "utf-8")
+          const oldLines = oldStr.split("\n").length
+          const newLines = newStr.split("\n").length
+          return `Patched ${filePath} (fuzzy match): replaced ${oldLines} line(s) with ${newLines} line(s)`
+        }
 
-        // Generate simple diff info
-        const oldLines = oldStr.split("\n").length
-        const newLines = newStr.split("\n").length
-        return `Patched ${filePath}: replaced ${oldLines} line(s) with ${newLines} line(s)`
+        return `Error: oldString not found in ${filePath}`
       }
 
       // Full write mode
@@ -336,6 +380,7 @@ function makeBash(): Tool {
             timeout: { type: "number", description: "Timeout in milliseconds (default: 120000)" },
           },
           required: ["command"],
+          additionalProperties: false,
         },
       },
     },
@@ -363,7 +408,7 @@ function makeBash(): Tool {
         proc.on("close", (code) => {
           clearTimeout(timer)
           const output = Buffer.concat(chunks).toString("utf-8")
-          const truncated = output.length > 50_000 ? output.slice(0, 50_000) + "\n...(truncated)" : output
+          const truncated = truncateOutput(output)
           const prefix = code !== 0 ? `[exit code: ${code}]\n` : ""
           done(prefix + truncated)
         })
@@ -391,6 +436,7 @@ function makeEval(): Tool {
             code: { type: "string", description: "JS/TS code to evaluate" },
           },
           required: ["code"],
+          additionalProperties: false,
         },
       },
     },
@@ -419,6 +465,76 @@ function makeEval(): Tool {
   }
 }
 
+function makeGlob(): Tool {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "Glob",
+        description: "Fast file pattern matching. Returns matching file paths. Use for finding files by name pattern (e.g. '**/*.ts', 'src/**/*.test.*'). Respects .gitignore.",
+        parameters: {
+          type: "object",
+          properties: {
+            pattern: { type: "string", description: "Glob pattern to match files against" },
+            path: { type: "string", description: "Directory to search in. Defaults to current working directory." },
+          },
+          required: ["pattern"],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(args) {
+      const dir = resolve(String(args.path ?? process.cwd()))
+      const glob = new Bun.Glob(String(args.pattern))
+      const results: string[] = []
+      for await (const file of glob.scan({ cwd: dir, onlyFiles: true, absolute: true })) {
+        results.push(file)
+        if (results.length >= 200) break
+      }
+      if (results.length === 0) return "No files matched the pattern."
+      return results.join("\n")
+    },
+  }
+}
+
+function makeGrep(): Tool {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "Grep",
+        description: "Search file contents using regex. Returns file paths and line numbers with matching lines. Use for finding where code/text patterns appear.",
+        parameters: {
+          type: "object",
+          properties: {
+            pattern: { type: "string", description: "Regex pattern to search for in file contents" },
+            path: { type: "string", description: "Directory to search in. Defaults to current working directory." },
+            include: { type: "string", description: "File pattern to filter (e.g. '*.ts', '*.{ts,tsx}')" },
+          },
+          required: ["pattern"],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(args) {
+      const dir = resolve(String(args.path ?? process.cwd()))
+      const rgArgs = ["--line-number", "--no-heading", "--color=never", "--max-count=100"]
+      if (args.include) rgArgs.push("--glob", String(args.include))
+      rgArgs.push(String(args.pattern), dir)
+      try {
+        const proc = Bun.spawn(["rg", ...rgArgs], { stdout: "pipe", stderr: "pipe" })
+        const output = await new Response(proc.stdout).text()
+        const exitCode = await proc.exited
+        if (exitCode === 1) return "No matches found."
+        if (!output.trim()) return "No matches found."
+        return truncateOutput(output.trim())
+      } catch {
+        return "Error: ripgrep (rg) not found. Install with: brew install ripgrep"
+      }
+    },
+  }
+}
+
 function makeLoadSkill(skillMap: Map<string, string>): Tool {
   return {
     definition: {
@@ -433,6 +549,7 @@ function makeLoadSkill(skillMap: Map<string, string>): Tool {
             name: { type: "string", description: "Skill name to load" },
           },
           required: ["name"],
+          additionalProperties: false,
         },
       },
     },
@@ -460,40 +577,56 @@ function makeTask(
       function: {
         name: "Task",
         description:
-          "Spawn a sub-agent to handle a task autonomously. The sub-agent gets its own conversation with the same tools and system prompt. Returns the final response.",
+          "Spawn a sub-agent to handle a complex task. The sub-agent has access to file, shell, and eval tools but cannot spawn further sub-agents. Use for delegating independent work.",
         parameters: {
           type: "object",
           properties: {
             description: { type: "string", description: "Short task description (3-5 words)" },
             prompt: { type: "string", description: "Detailed task instructions for the sub-agent" },
+            timeout: { type: "number", description: "Timeout in milliseconds (default: 300000 = 5 min)" },
           },
           required: ["description", "prompt"],
+          additionalProperties: false,
         },
       },
     },
     async execute(args) {
       const prompt = String(args.prompt)
       const desc = String(args.description ?? "sub-task")
+      const timeout = Number(args.timeout ?? 300_000)
       process.stderr.write(`\x1b[90m[Task: ${desc}]\x1b[0m\n`)
+
+      // Sub-agent tools: everything EXCEPT Task (no recursive spawning)
+      const subTools = tools.filter(t => t.definition.function.name !== "Task")
 
       const subMessages: Message[] = [
         { role: "system", content: systemPrompt },
         { role: "user", content: prompt },
       ]
 
-      const toolDefs = tools.map((t) => t.definition)
-      const toolMap = new Map(tools.map((t) => [t.definition.function.name, t]))
+      const toolDefs = subTools.map((t) => t.definition)
+      const toolMap = new Map(subTools.map((t) => [t.definition.function.name, t]))
       const MAX_TURNS = 20
+      const deadline = Date.now() + timeout
+      let lastContent = ""
 
       for (let turn = 0; turn < MAX_TURNS; turn++) {
+        if (Date.now() > deadline) {
+          return `<task_result task="${desc}">\nTask timed out after ${timeout}ms\n</task_result>`
+        }
+
         const reply = await ollamaChat(model, subMessages, toolDefs)  // no streaming callbacks for sub-agents
         subMessages.push(reply)
+        lastContent = reply.content
 
         if (!reply.tool_calls?.length) {
-          return `[Task: ${desc}]\n${reply.content}`
+          return `<task_result task="${desc}">\n${truncateOutput(reply.content)}\n</task_result>`
         }
 
         for (const call of reply.tool_calls) {
+          if (Date.now() > deadline) {
+            return `<task_result task="${desc}">\nTask timed out after ${timeout}ms\n</task_result>`
+          }
           const tool = toolMap.get(call.function.name)
           const result = tool
             ? await tool.execute(call.function.arguments)
@@ -502,7 +635,7 @@ function makeTask(
         }
       }
 
-      return `[Task: ${desc}] Reached max turns (${MAX_TURNS})`
+      return `<task_result task="${desc}">\nReached max turns (${MAX_TURNS}). Last response:\n${truncateOutput(lastContent)}\n</task_result>`
     },
   }
 }
@@ -684,8 +817,10 @@ async function main() {
   const writeFileTool = makeWriteFile()
   const bashTool = makeBash()
   const evalTool = makeEval()
+  const globTool = makeGlob()
+  const grepTool = makeGrep()
   const loadSkillTool = makeLoadSkill(skillMap)
-  const coreTools = [readFileTool, writeFileTool, bashTool, evalTool, loadSkillTool]
+  const coreTools = [readFileTool, writeFileTool, bashTool, evalTool, globTool, grepTool, loadSkillTool]
 
   // 5. Build system prompt from core tool defs (Task added manually to description)
   const allToolDefs = [
