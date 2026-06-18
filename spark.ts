@@ -15,6 +15,7 @@ interface Message {
   content: string
   tool_calls?: ToolCall[]
   thinking?: string
+  tool_name?: string
 }
 
 interface ToolCall {
@@ -473,7 +474,7 @@ function makeTask(
           const result = tool
             ? await tool.execute(call.function.arguments)
             : `Error: unknown tool '${call.function.name}'`
-          subMessages.push({ role: "tool", content: result })
+          subMessages.push({ role: "tool", content: result, tool_name: call.function.name })
         }
       }
 
@@ -778,7 +779,7 @@ async function main() {
           const preview = result.length > 500 ? result.slice(0, 500) + `\n${COLORS.dim}...(${result.length} chars total)${COLORS.reset}` : result
           console.log(`${COLORS.dim}${preview}${COLORS.reset}`)
 
-          messages.push({ role: "tool", content: result })
+          messages.push({ role: "tool", content: result, tool_name: toolName })
         }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err)
