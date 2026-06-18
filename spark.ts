@@ -352,6 +352,48 @@ function makeBash(): Tool {
   }
 }
 
+function makeEval(): Tool {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "Eval",
+        description:
+          "Evaluate JavaScript or TypeScript code inside the agent process (Bun runtime). Returns the result of the last expression, or console output. Use for quick calculations, data transforms, or testing snippets.",
+        parameters: {
+          type: "object",
+          properties: {
+            code: { type: "string", description: "JS/TS code to evaluate" },
+          },
+          required: ["code"],
+        },
+      },
+    },
+    async execute(args) {
+      const code = String(args.code)
+      const logs: string[] = []
+      const fakeConsole = {
+        log: (...a: unknown[]) => logs.push(a.map(String).join(" ")),
+        error: (...a: unknown[]) => logs.push("[stderr] " + a.map(String).join(" ")),
+        warn: (...a: unknown[]) => logs.push("[warn] " + a.map(String).join(" ")),
+        info: (...a: unknown[]) => logs.push(a.map(String).join(" ")),
+      }
+      try {
+        const transpiler = new Bun.Transpiler({ loader: "ts" })
+        const js = transpiler.transformSync(code)
+        const fn = new Function("console", `return (async () => { ${js} })()`)
+        const result = await fn(fakeConsole)
+        const output = logs.length ? logs.join("\n") + "\n" : ""
+        const resultStr = result !== undefined ? String(result) : ""
+        return (output + resultStr).trim() || "(no output)"
+      } catch (err: unknown) {
+        const output = logs.length ? logs.join("\n") + "\n" : ""
+        return output + `Error: ${err instanceof Error ? err.message : String(err)}`
+      }
+    },
+  }
+}
+
 function makeLoadSkill(skillMap: Map<string, string>): Tool {
   return {
     definition: {
@@ -516,7 +558,6 @@ function buildSystemPrompt(agentInstructions: string, skillList: string, model: 
 - Be concise and direct. No preamble, no filler.
 - When referring to code, use \`file_path:line_number\` references.
 - Prefer editing existing files over creating new ones.
-- Never commit to git unless explicitly asked.
 - If a task requires multiple independent tool calls, make them all at once.
 - Verify your work — run the code, check the output, confirm it works.
 
@@ -616,8 +657,9 @@ async function main() {
   const readFileTool = makeReadFile()
   const writeFileTool = makeWriteFile()
   const bashTool = makeBash()
+  const evalTool = makeEval()
   const loadSkillTool = makeLoadSkill(skillMap)
-  const coreTools = [readFileTool, writeFileTool, bashTool, loadSkillTool]
+  const coreTools = [readFileTool, writeFileTool, bashTool, evalTool, loadSkillTool]
 
   // 5. Build system prompt from core tool defs (Task added manually to description)
   const allToolDefs = [
