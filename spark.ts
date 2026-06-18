@@ -432,29 +432,22 @@ async function loadAgentInstructions(): Promise<string> {
 
 // ── System Prompt Builder ────────────────────────────────────────────────────
 
-function buildSystemPrompt(agentInstructions: string, skillList: string, toolDefs: ToolDef[]): string {
-  const toolDescriptions = toolDefs
-    .map((t) => `- **${t.function.name}**: ${t.function.description.split("\n")[0]}`)
-    .join("\n")
-
+function buildSystemPrompt(agentInstructions: string, skillList: string): string {
   return `You are spark — a local AI coding agent running on Ollama.
 
-## Your Tools
-${toolDescriptions}
-
-## Available Skills (use LoadSkill to load one)
+## Available Skills (use LoadSkill tool to read one)
 ${skillList || "(no skills found)"}
 
 ## Agent Instructions
 ${agentInstructions || "(no agents.md found)"}
 
 ## Guidelines
-- Use ReadFile to understand code before making changes
-- Use WriteFile in patch mode (oldString/newString) for surgical edits
-- Use WriteFile with content for new files or full rewrites
-- Use Bash for running commands, tests, git operations
-- Use LoadSkill when you need specialized workflow instructions
-- Use Task to delegate complex sub-tasks to a fresh agent
+- Use ReadFile to understand code before making changes.
+- Use WriteFile in patch mode (oldString/newString) for surgical edits.
+- Use WriteFile with content only for new files or full rewrites.
+- Use Bash for running commands, tests, git operations.
+- Use LoadSkill when you need specialized workflow instructions.
+- Use Task to delegate complex sub-tasks to a fresh agent.
 - Be concise. Show relevant output. Explain your reasoning briefly.
 `
 }
@@ -557,7 +550,7 @@ async function main() {
     ...coreTools.map((t) => t.definition),
     makeTask("", "", []).definition, // just for the schema/description
   ]
-  const systemPrompt = buildSystemPrompt(agentInstructions, skillList, allToolDefs)
+  const systemPrompt = buildSystemPrompt(agentInstructions, skillList)
 
   // 6. Build full tool set with Task having a lazy systemPrompt reference
   const buildTools = () => {
