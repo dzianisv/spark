@@ -44,19 +44,85 @@ interface Tool {
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434"
 
+interface StreamCallbacks {
+  onThinking?: (chunk: string) => void
+  onContent?: (chunk: string) => void
+}
+
 async function ollamaChat(
   model: string,
   messages: Message[],
   tools: ToolDef[],
+  callbacks?: StreamCallbacks,
 ): Promise<Message> {
   const res = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, tools, stream: false }),
+    body: JSON.stringify({ model, messages, tools, stream: true, think: true }),
   })
   if (!res.ok) throw new Error(`Ollama error ${res.status}: ${await res.text()}`)
-  const data = (await res.json()) as { message: Message }
-  return data.message
+
+  const reader = res.body?.getReader()
+  if (!reader) throw new Error("No response body")
+
+  const decoder = new TextDecoder()
+  let content = ""
+  let thinking = ""
+  let toolCalls: ToolCall[] = []
+  let buf = ""
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buf += decoder.decode(value, { stream: true })
+    const lines = buf.split("\n")
+    buf = lines.pop() ?? "" // keep incomplete last line
+
+    for (const line of lines) {
+      if (!line.trim()) continue
+      let chunk: { message?: { content?: string; thinking?: string; tool_calls?: ToolCall[] }; done?: boolean }
+      try { chunk = JSON.parse(line) } catch { continue }
+
+      const msg = chunk.message
+      if (!msg) continue
+
+      if (msg.thinking) {
+        thinking += msg.thinking
+        callbacks?.onThinking?.(msg.thinking)
+      }
+      if (msg.content) {
+        content += msg.content
+        callbacks?.onContent?.(msg.content)
+      }
+      if (msg.tool_calls?.length) {
+        toolCalls.push(...msg.tool_calls)
+      }
+    }
+  }
+
+  // parse leftover buffer
+  if (buf.trim()) {
+    try {
+      const chunk = JSON.parse(buf) as { message?: { content?: string; thinking?: string; tool_calls?: ToolCall[] } }
+      if (chunk.message?.thinking) {
+        thinking += chunk.message.thinking
+        callbacks?.onThinking?.(chunk.message.thinking)
+      }
+      if (chunk.message?.content) {
+        content += chunk.message.content
+        callbacks?.onContent?.(chunk.message.content)
+      }
+      if (chunk.message?.tool_calls?.length) {
+        toolCalls.push(...chunk.message.tool_calls)
+      }
+    } catch {}
+  }
+
+  const result: Message = { role: "assistant", content }
+  if (thinking) result.thinking = thinking
+  if (toolCalls.length) result.tool_calls = toolCalls
+  return result
 }
 
 async function ollamaModels(): Promise<string[]> {
@@ -353,7 +419,7 @@ function makeTask(
       const MAX_TURNS = 20
 
       for (let turn = 0; turn < MAX_TURNS; turn++) {
-        const reply = await ollamaChat(model, subMessages, toolDefs)
+        const reply = await ollamaChat(model, subMessages, toolDefs)  // no streaming callbacks for sub-agents
         subMessages.push(reply)
 
         if (!reply.tool_calls?.length) {
@@ -432,23 +498,32 @@ async function loadAgentInstructions(): Promise<string> {
 
 // ── System Prompt Builder ────────────────────────────────────────────────────
 
-function buildSystemPrompt(agentInstructions: string, skillList: string): string {
-  return `You are spark — a local AI coding agent running on Ollama.
+function buildSystemPrompt(agentInstructions: string, skillList: string, model: string): string {
+  const cwd = process.cwd()
+  const today = new Date().toLocaleDateString("en-CA") // YYYY-MM-DD
+  const platform = process.platform
 
-## Available Skills (use LoadSkill tool to read one)
-${skillList || "(no skills found)"}
+  return `You are spark, an interactive CLI coding agent. You solve coding tasks by reading, writing, and running code directly.
 
-## Agent Instructions
-${agentInstructions || "(no agents.md found)"}
+<env>
+  Model: ${model}
+  Working directory: ${cwd}
+  Platform: ${platform}
+  Today: ${today}
+</env>
 
-## Guidelines
-- Use ReadFile to understand code before making changes.
-- Use WriteFile in patch mode (oldString/newString) for surgical edits.
-- Use WriteFile with content only for new files or full rewrites.
-- Use Bash for running commands, tests, git operations.
-- Use LoadSkill when you need specialized workflow instructions.
-- Use Task to delegate complex sub-tasks to a fresh agent.
-- Be concise. Show relevant output. Explain your reasoning briefly.
+## Behavior
+- Be concise and direct. No preamble, no filler.
+- When referring to code, use \`file_path:line_number\` references.
+- Prefer editing existing files over creating new ones.
+- Never commit to git unless explicitly asked.
+- If a task requires multiple independent tool calls, make them all at once.
+- Verify your work — run the code, check the output, confirm it works.
+
+## Available Skills
+Use LoadSkill to read a skill's full instructions when a task matches.
+${skillList || "(none)"}
+${agentInstructions ? `\n## Agent Instructions\n${agentInstructions}` : ""}
 `
 }
 
@@ -465,9 +540,9 @@ const COLORS = {
   magenta: "\x1b[35m",
 }
 
-function printHeader(model: string) {
+function printHeader(model: string, skillCount: number) {
   console.log(`${COLORS.cyan}${COLORS.bold}spark${COLORS.reset} ${COLORS.dim}— AI coding agent${COLORS.reset}`)
-  console.log(`${COLORS.dim}Model: ${COLORS.reset}${model}`)
+  console.log(`${COLORS.dim}Model:${COLORS.reset} ${model}  ${COLORS.dim}Skills:${COLORS.reset} ${skillCount}  ${COLORS.dim}Dir:${COLORS.reset} ${process.cwd()}`)
   console.log(`${COLORS.dim}Commands: /models /clear /quit${COLORS.reset}`)
   console.log()
 }
@@ -528,7 +603,6 @@ async function main() {
     console.log(`${COLORS.dim}Restored saved model: ${savedModel}${COLORS.reset}`)
   } else {
     currentModel = pickBestModel(models)
-    console.log(`${COLORS.dim}Ranked ${models.length} models, auto-selected best for coding.${COLORS.reset}`)
   }
 
   // 2. Load skills
@@ -550,7 +624,7 @@ async function main() {
     ...coreTools.map((t) => t.definition),
     makeTask("", "", []).definition, // just for the schema/description
   ]
-  const systemPrompt = buildSystemPrompt(agentInstructions, skillList)
+  const systemPrompt = buildSystemPrompt(agentInstructions, skillList, currentModel)
 
   // 6. Build full tool set with Task having a lazy systemPrompt reference
   const buildTools = () => {
@@ -561,9 +635,7 @@ async function main() {
   // 6. Init conversation
   const messages: Message[] = [{ role: "system", content: systemPrompt }]
 
-  printHeader(currentModel)
-  console.log(`${COLORS.dim}Skills loaded: ${skillMap.size}${COLORS.reset}`)
-  console.log(`${COLORS.dim}Working directory: ${process.cwd()}${COLORS.reset}\n`)
+  printHeader(currentModel, skillMap.size)
 
   // 7. REPL loop
   const rl = createInterface({ input: process.stdin, output: process.stdout })
@@ -608,24 +680,38 @@ async function main() {
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       try {
-        process.stderr.write(`${COLORS.dim}Thinking...${COLORS.reset}\r`)
-        const reply = await ollamaChat(currentModel, messages, toolDefsForCall)
-        process.stderr.write("           \r") // clear "Thinking..."
+        let thinkingStarted = false
+        let contentStarted = false
+
+        const reply = await ollamaChat(currentModel, messages, toolDefsForCall, {
+          onThinking(chunk) {
+            if (!thinkingStarted) {
+              process.stdout.write(`${COLORS.dim}`)
+              thinkingStarted = true
+            }
+            process.stdout.write(chunk)
+          },
+          onContent(chunk) {
+            if (thinkingStarted && !contentStarted) {
+              process.stdout.write(`${COLORS.reset}\n\n`)
+            }
+            if (!contentStarted) contentStarted = true
+            process.stdout.write(chunk)
+          },
+        })
+
+        if (thinkingStarted && !contentStarted) process.stdout.write(`${COLORS.reset}`)
 
         messages.push(reply)
 
-        // If thinking is present, show it dimmed
-        if (reply.thinking) {
-          process.stderr.write(`${COLORS.dim}${reply.thinking.trim().slice(0, 200)}...${COLORS.reset}\n`)
-        }
-
-        // No tool calls → print response and break
+        // No tool calls → finalize streamed response
         if (!reply.tool_calls?.length) {
-          if (reply.content) {
-            console.log(`\n${reply.content}\n`)
-          }
+          if (contentStarted || thinkingStarted) process.stdout.write("\n\n")
           break
         }
+
+        // If there were tool calls, close any open styling
+        if (thinkingStarted || contentStarted) process.stdout.write(`${COLORS.reset}\n`)
 
         // Execute tool calls
         for (const call of reply.tool_calls) {
