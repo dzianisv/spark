@@ -10,12 +10,36 @@ import { createInterface } from "node:readline"
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+// Tool call ID correlation across providers:
+//
+// OpenAI Chat Completions API:
+//   - Assistant response: tool_calls[].id (e.g. "call_12345xyz")
+//   - Tool result message: { role: "tool", tool_call_id: "<id>", content: "..." }
+//   - tool_call_id is REQUIRED for correlation
+//
+// Ollama native /api/chat:
+//   - Assistant response: tool_calls[].id MAY be present
+//   - Tool result message: { role: "tool", content: "...", tool_name: "func_name" }
+//   - Ollama uses tool_name for correlation, tool_call_id is ignored
+//
+// Ollama OpenAI-compatible /v1/chat/completions:
+//   - Follows OpenAI format, includes tool_calls[].id
+//   - Tool result: { role: "tool", tool_call_id: "<id>", content: "..." }
+//
+// Vercel AI SDK (@ai-sdk/openai-compatible):
+//   - Non-streaming: toolCall.id ?? generateId() (synthetic 16-char random if missing)
+//   - Streaming: REQUIRES id on first delta chunk (throws InvalidResponseDataError if null)
+//   - Sends results as: { role: "tool", tool_call_id: "<id>", content: "..." }
+//
+// Strategy: we send BOTH tool_name (for Ollama native) and tool_call_id (for OpenAI compat).
+// Extra fields are ignored by each provider, so this is safe for both endpoints.
 interface Message {
   role: "system" | "user" | "assistant" | "tool"
   content: string
   tool_calls?: ToolCall[]
   thinking?: string
   tool_name?: string
+  tool_call_id?: string
 }
 
 interface ToolCall {
@@ -474,7 +498,7 @@ function makeTask(
           const result = tool
             ? await tool.execute(call.function.arguments)
             : `Error: unknown tool '${call.function.name}'`
-          subMessages.push({ role: "tool", content: result, tool_name: call.function.name })
+          subMessages.push({ role: "tool", content: result, tool_name: call.function.name, tool_call_id: call.id })
         }
       }
 
@@ -556,6 +580,7 @@ function buildSystemPrompt(agentInstructions: string, skillList: string, model: 
 </env>
 
 ## Behavior
+- You have all the tools/functions to complete the task. Do not backdelegate to the user unless you are truly stuck.
 - Be concise and direct. No preamble, no filler.
 - When referring to code, use \`file_path:line_number\` references.
 - Prefer editing existing files over creating new ones.
@@ -779,7 +804,7 @@ async function main() {
           const preview = result.length > 500 ? result.slice(0, 500) + `\n${COLORS.dim}...(${result.length} chars total)${COLORS.reset}` : result
           console.log(`${COLORS.dim}${preview}${COLORS.reset}`)
 
-          messages.push({ role: "tool", content: result, tool_name: toolName })
+          messages.push({ role: "tool", content: result, tool_name: toolName, tool_call_id: call.id })
         }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err)
