@@ -1023,7 +1023,7 @@ async function main() {
 
     // Agent loop: call model, handle tool calls, repeat until text response
     const tools = buildTools()
-    const autopilotState = { exited: false }
+    const autopilotState = { exited: false, summarized: false }
     if (autopilot) tools.push(makeAutopilotExit(autopilotState))
     let reflections = 0
     const toolDefsForCall = tools.map((t) => t.definition)
@@ -1099,7 +1099,9 @@ async function main() {
 
             messages.push({ role: "tool", content: result, tool_name: toolName, tool_call_id: call.id })
           }
-          if (autopilotState.exited) {
+          if (autopilotState.exited && !autopilotState.summarized) {
+            autopilotState.summarized = true
+            autopilot = false // exit returns to normal mode (blog: switch to build); re-arm with /autopilot
             messages.push({ role: "user", content: AUTOPILOT_SUMMARY_PROMPT })
           }
         } catch (err: unknown) {
