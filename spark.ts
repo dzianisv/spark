@@ -755,30 +755,40 @@ function makeRunTests(): Tool {
       const hasGoMod = await stat(join(workdir, "go.mod")).then(() => true).catch(() => false)
       const hasCargoToml = await stat(join(workdir, "Cargo.toml")).then(() => true).catch(() => false)
 
+      // Build spawn args arrays to avoid shell injection
+      let spawnCmd: string[]
       if (pkgContent) {
         const pkg = JSON.parse(pkgContent).scripts ?? {}
         if (hasBunLockb || pkgContent.includes('"bun"')) {
+          spawnCmd = filter ? ["bun", "test", filter] : ["bun", "test"]
           cmd = filter ? `bun test ${filter}` : "bun test"
         } else if (pkg.test?.includes("jest") || pkgContent.includes('"jest"')) {
+          spawnCmd = filter ? ["npx", "jest", filter] : ["npx", "jest"]
           cmd = filter ? `npx jest ${filter}` : "npx jest"
         } else if (pkg.test) {
+          spawnCmd = filter ? ["npm", "test", "--", filter] : ["npm", "test"]
           cmd = filter ? `npm test -- ${filter}` : "npm test"
         } else {
+          spawnCmd = filter ? ["bun", "test", filter] : ["bun", "test"]
           cmd = filter ? `bun test ${filter}` : "bun test"
         }
       } else if (hasPytest) {
+        spawnCmd = filter ? ["python", "-m", "pytest", filter, "-v"] : ["python", "-m", "pytest", "-v"]
         cmd = filter ? `python -m pytest ${filter} -v` : "python -m pytest -v"
       } else if (hasGoMod) {
+        spawnCmd = filter ? ["go", "test", "./...", "-run", filter] : ["go", "test", "./..."]
         cmd = filter ? `go test ./... -run ${filter}` : "go test ./..."
       } else if (hasCargoToml) {
+        spawnCmd = filter ? ["cargo", "test", filter] : ["cargo", "test"]
         cmd = filter ? `cargo test ${filter}` : "cargo test"
       } else {
+        spawnCmd = filter ? ["bun", "test", filter] : ["bun", "test"]
         cmd = filter ? `bun test ${filter}` : "bun test"
       }
 
       return new Promise<string>((done) => {
         const chunks: Buffer[] = []
-        const proc = spawn("sh", ["-c", cmd], {
+        const proc = spawn(spawnCmd[0], spawnCmd.slice(1), {
           cwd: workdir,
           stdio: ["ignore", "pipe", "pipe"],
           env: { ...process.env },
@@ -888,8 +898,10 @@ function makeFindSymbol(): Tool {
       const dir = resolve(String(args.path ?? process.cwd()))
       const include = args.include ? String(args.include) : undefined
 
+      // Escape name to prevent regex injection
+      const safeName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
       // Build a pattern that matches common definition forms
-      const defPattern = `(function\\s+${name}|class\\s+${name}|const\\s+${name}\\s*=|let\\s+${name}\\s*=|var\\s+${name}\\s*=|def\\s+${name}|type\\s+${name}\\s*=|interface\\s+${name}[\\s{]|enum\\s+${name}[\\s{])`
+      const defPattern = `(function\\s+${safeName}|class\\s+${safeName}|const\\s+${safeName}\\s*=|let\\s+${safeName}\\s*=|var\\s+${safeName}\\s*=|def\\s+${safeName}|type\\s+${safeName}\\s*=|interface\\s+${safeName}[\\s{]|enum\\s+${safeName}[\\s{])`
 
       const rgArgs = ["--line-number", "--no-heading", "--color=never", "-e", defPattern]
       if (include) rgArgs.push("--glob", include)
@@ -1833,6 +1845,7 @@ Start with PHASE 1 now.`
           if (autopilotState.exited && !autopilotState.summarized) {
             autopilotState.summarized = true
             autopilot = false // exit returns to normal mode (blog: switch to build); re-arm with /autopilot
+            phasedAutopilot = false
             messages.push({ role: "user", content: AUTOPILOT_SUMMARY_PROMPT })
           }
         } catch (err: unknown) {
