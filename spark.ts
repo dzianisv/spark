@@ -197,6 +197,91 @@ function pickBestModel(models: string[]): string {
   })[0]
 }
 
+// ── Context Compaction ───────────────────────────────────────────────────────
+
+export const CHARS_PER_TOKEN = 4
+export function estimateTokens(messages: Message[]): number {
+  let chars = 0
+  for (const m of messages) {
+    chars += m.content?.length ?? 0
+    if (m.tool_calls) for (const c of m.tool_calls) chars += JSON.stringify(c.function).length
+  }
+  return Math.round(chars / CHARS_PER_TOKEN)
+}
+
+export function splitTurns(body: Message[]): Message[][] {
+  if (body.length === 0) return []
+  const turns: Message[][] = []
+  let current: Message[] = []
+
+  for (const msg of body) {
+    if (msg.role === "user" && current.length > 0) {
+      turns.push(current)
+      current = []
+    }
+    current.push(msg)
+  }
+  if (current.length > 0) turns.push(current)
+  return turns
+}
+
+export const TAIL_TURNS = 2
+export const COMPACT_THRESHOLD = Number(process.env.SPARK_COMPACT_THRESHOLD) || 32000
+
+const SUMMARY_SYSTEM =
+  "You are a context summarization assistant for a coding agent session. Summarize ONLY the conversation history given. Do not answer or continue the conversation. Do not mention that you are summarizing. Preserve exact file paths, commands, code identifiers, and error strings verbatim. Be terse — bullets, not prose."
+
+const SUMMARY_INSTRUCTION =
+  "Summarize the conversation above into EXACTLY this markdown template. Keep every section header even if its content is empty. Use terse bullets.\n\n## Goal\n## Constraints & Preferences\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key Decisions\n## Next Steps\n## Critical Context\n## Relevant Files"
+
+export async function compactMessages(model: string, messages: Message[]): Promise<boolean> {
+  const body = messages.slice(1)
+  const turns = splitTurns(body)
+  if (turns.length <= TAIL_TURNS) return false
+
+  const tailTurns = turns.slice(-TAIL_TURNS)
+  const headTurns = turns.slice(0, turns.length - TAIL_TURNS)
+  const head = headTurns.flat()
+  const tail = tailTurns.flat()
+
+  // Render head into plain-text transcript
+  const lines: string[] = []
+  for (const msg of head) {
+    const content = (msg.content ?? "").slice(0, 2000)
+    if (msg.role === "tool") {
+      const label = msg.tool_name ? `TOOL(${msg.tool_name})` : "TOOL"
+      lines.push(`${label}: ${content}`)
+    } else {
+      lines.push(`${msg.role.toUpperCase()}: ${content}`)
+      if (msg.tool_calls) {
+        for (const c of msg.tool_calls) {
+          const args = JSON.stringify(c.function.arguments).slice(0, 2000)
+          lines.push(`[called tool: ${c.function.name}(${args})]`)
+        }
+      }
+    }
+  }
+  const transcript = lines.join("\n")
+
+  const reply = await ollamaChat(
+    model,
+    [
+      { role: "system", content: SUMMARY_SYSTEM },
+      { role: "user", content: transcript + "\n\n" + SUMMARY_INSTRUCTION },
+    ],
+    [],
+  )
+  const summary = reply.content
+
+  messages.splice(
+    1,
+    messages.length - 1,
+    { role: "user", content: "[Earlier conversation compacted to summary]\n\n" + summary },
+    ...tail,
+  )
+  return true
+}
+
 // ── Utilities ────────────────────────────────────────────────────────────────
 
 function truncateOutput(output: string, max = 30_000): string {
@@ -1004,6 +1089,19 @@ async function main() {
       continue
     }
 
+    if (trimmed === "/compact") {
+      const before = estimateTokens(messages)
+      const compacted = await compactMessages(currentModel, messages)
+      if (!compacted) {
+        const turns = splitTurns(messages.slice(1))
+        console.log(`${COLORS.dim}nothing to compact (${turns.length} turns)${COLORS.reset}`)
+      } else {
+        const after = estimateTokens(messages)
+        console.log(`↯ compacted: ${before} → ${after} est. tokens (kept system + last ${TAIL_TURNS} turns)`)
+      }
+      continue
+    }
+
     if (trimmed === "/autopilot") {
       console.log(autopilot ? `autopilot: ON` : `autopilot: OFF`)
       continue
@@ -1041,6 +1139,12 @@ async function main() {
 
     supervise: while (true) {
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        if (estimateTokens(messages) > COMPACT_THRESHOLD) {
+          const before = estimateTokens(messages)
+          if (await compactMessages(currentModel, messages))
+            console.log(`↯ auto-compacted: ${before} → ${estimateTokens(messages)} est. tokens`)
+        }
+
         try {
           let thinkingStarted = false
           let contentStarted = false

@@ -3,7 +3,7 @@
 // Requires: Ollama running with at least one model
 
 import { test, expect, beforeAll, describe } from "bun:test"
-import { parseVerdict, checkGoal, makeAutopilotExit, AUTOPILOT_NUDGE, MAX_AUTOPILOT_REFLECTIONS, AUTOPILOT_SUMMARY_PROMPT } from "./spark.ts"
+import { parseVerdict, checkGoal, makeAutopilotExit, AUTOPILOT_NUDGE, MAX_AUTOPILOT_REFLECTIONS, AUTOPILOT_SUMMARY_PROMPT, estimateTokens, splitTurns, compactMessages, TAIL_TURNS } from "./spark.ts"
 import type { Message as SparkMessage } from "./spark.ts"
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -653,4 +653,123 @@ describe("autopilot", () => {
   test("AUTOPILOT_SUMMARY_PROMPT contains 'summarize'", () => {
     expect(AUTOPILOT_SUMMARY_PROMPT).toContain("summarize")
   })
+})
+
+// ── Compaction Tests ─────────────────────────────────────────────────────────
+
+describe("compaction", () => {
+  // ── Deterministic unit tests (no LLM) ──────────────────────────────────────
+
+  test("estimateTokens — returns ~chars/4 for known message set", () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "abcd" },      // 4 chars
+      { role: "user", content: "efgh" },         // 4 chars
+      { role: "assistant", content: "ijkl" },    // 4 chars
+    ]
+    // 12 chars total → 3 tokens
+    const tokens = estimateTokens(messages)
+    expect(tokens).toBe(3)
+  })
+
+  test("estimateTokens — counts tool_calls function JSON", () => {
+    const messages: SparkMessage[] = [
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          { id: "1", function: { name: "ReadFile", arguments: { filePath: "a.ts" } } },
+        ],
+      },
+    ]
+    const json = JSON.stringify({ name: "ReadFile", arguments: { filePath: "a.ts" } })
+    const expected = Math.round(json.length / 4)
+    expect(estimateTokens(messages)).toBe(expected)
+  })
+
+  test("splitTurns — [user, assistant(tool_calls), tool, user, assistant] → 2 turns", () => {
+    const messages: SparkMessage[] = [
+      { role: "user", content: "do something" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "1", function: { name: "Bash", arguments: { command: "ls" } } }],
+      },
+      { role: "tool", content: "file1.ts\nfile2.ts", tool_name: "Bash", tool_call_id: "1" },
+      { role: "user", content: "now summarize" },
+      { role: "assistant", content: "Here is the summary." },
+    ]
+    const turns = splitTurns(messages)
+    expect(turns.length).toBe(2)
+    // First turn: user + assistant(tool_calls) + tool
+    expect(turns[0].length).toBe(3)
+    expect(turns[0][0].role).toBe("user")
+    expect(turns[0][1].role).toBe("assistant")
+    expect(turns[0][2].role).toBe("tool")
+    // Second turn: user + assistant
+    expect(turns[1].length).toBe(2)
+    expect(turns[1][0].role).toBe("user")
+    expect(turns[1][1].role).toBe("assistant")
+  })
+
+  test("splitTurns — assistant-leading body forms its own first turn", () => {
+    const messages: SparkMessage[] = [
+      { role: "assistant", content: "preamble" },
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "world" },
+    ]
+    const turns = splitTurns(messages)
+    expect(turns.length).toBe(2)
+    expect(turns[0][0].role).toBe("assistant")
+    expect(turns[1][0].role).toBe("user")
+  })
+
+  test("splitTurns — single user+assistant is one turn", () => {
+    const messages: SparkMessage[] = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ]
+    const turns = splitTurns(messages)
+    expect(turns.length).toBe(1)
+    expect(turns[0].length).toBe(2)
+  })
+
+  test("splitTurns — empty body returns empty array", () => {
+    expect(splitTurns([])).toEqual([])
+  })
+
+  // ── Live Ollama integration test ────────────────────────────────────────────
+
+  test("compactMessages — summary is non-empty and starts with compaction marker", async () => {
+    // Build a message array with 3 turns so compaction kicks in (TAIL_TURNS=2 → head=turn1)
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark, a coding agent." },
+      // turn 1
+      { role: "user", content: "Read spark.ts and tell me about it." },
+      { role: "assistant", content: "spark.ts is a single-file AI coding agent using Ollama." },
+      // turn 2
+      { role: "user", content: "How many tools does it define?" },
+      { role: "assistant", content: "It defines 7 tools: ReadFile, WriteFile, Bash, Eval, Glob, Grep, LoadSkill." },
+      // turn 3 (tail)
+      { role: "user", content: "What is the entry point?" },
+      { role: "assistant", content: "The entry point is the main() function guarded by import.meta.main." },
+    ]
+
+    const compacted = await compactMessages(agentModel, messages)
+    expect(compacted).toBe(true)
+
+    // messages[0] is still the system prompt
+    expect(messages[0].role).toBe("system")
+
+    // messages[1] should be the compaction summary
+    const summaryMsg = messages[1]
+    expect(summaryMsg.role).toBe("user")
+    expect(summaryMsg.content).toBeTruthy()
+    expect(summaryMsg.content.startsWith("[Earlier conversation compacted to summary]")).toBe(true)
+    expect(summaryMsg.content.length).toBeGreaterThan(50)
+
+    // The tail (last TAIL_TURNS=2 turns = turn 2 + turn 3) should follow
+    const tailStart = messages[2]
+    expect(tailStart.role).toBe("user")
+    expect(tailStart.content).toBe("How many tools does it define?")
+  }, TIMEOUT)
 })
