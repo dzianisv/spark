@@ -1212,8 +1212,37 @@ async function main() {
       rl.question(`${COLORS.green}> ${COLORS.reset}`, res)
     })
 
+  // Collect lines: bare Enter submits; trailing \ continues to next line.
+  const promptMultiline = async (): Promise<string> => {
+    const lines: string[] = []
+    while (true) {
+      const line = await prompt()
+      if (line.endsWith("\\")) {
+        lines.push(line.slice(0, -1))
+        process.stdout.write(`${COLORS.green}... ${COLORS.reset}`)
+      } else {
+        lines.push(line)
+        return lines.join("\n")
+      }
+    }
+  }
+
+  // Open $EDITOR on a temp file and return its contents.
+  const openEditor = (): Promise<string> =>
+    new Promise((res, rej) => {
+      const tmp = join(homedir(), `.spark_edit_${Date.now()}.txt`)
+      const editor = process.env.EDITOR ?? process.env.VISUAL ?? "vi"
+      const child = spawn(editor, [tmp], { stdio: "inherit" })
+      child.on("error", rej)
+      child.on("close", () =>
+        readFile(tmp, "utf8")
+          .then((t) => unlink(tmp).catch(() => {}).then(() => res(t.trim())))
+          .catch(rej),
+      )
+    })
+
   while (true) {
-    const input = await prompt()
+    const input = await promptMultiline()
     const trimmed = input.trim()
     if (!trimmed) continue
 
@@ -1275,6 +1304,20 @@ async function main() {
     }
 
     let skipGenericPush = false
+
+    if (trimmed === "/edit") {
+      let edited: string
+      try {
+        edited = await openEditor()
+      } catch {
+        console.log(`${COLORS.dim}editor failed or cancelled${COLORS.reset}`)
+        continue
+      }
+      if (!edited) { console.log(`${COLORS.dim}(empty, skipped)${COLORS.reset}`); continue }
+      messages.push({ role: "user", content: edited })
+      skipGenericPush = true
+      // fall through to agent loop
+    }
 
     if (trimmed.startsWith("/autopilot ")) {
       const arg = trimmed.slice("/autopilot ".length).trim()
