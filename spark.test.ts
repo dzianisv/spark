@@ -3,7 +3,7 @@
 // Requires: Ollama running with at least one model
 
 import { test, expect, beforeAll, describe } from "bun:test"
-import { parseVerdict, checkGoal } from "./spark.ts"
+import { parseVerdict, checkGoal, makeAutopilotExit, AUTOPILOT_NUDGE, MAX_AUTOPILOT_REFLECTIONS, AUTOPILOT_SUMMARY_PROMPT } from "./spark.ts"
 import type { Message as SparkMessage } from "./spark.ts"
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -623,4 +623,39 @@ describe("goal supervisor", () => {
     const verdict = await checkGoal(judgeModel, "Make all tests pass", messages)
     expect(verdict.reached).toBe(false)
   }, TIMEOUT)
+})
+
+// ── Autopilot Tests ──────────────────────────────────────────────────────────
+
+describe("autopilot", () => {
+  test("makeAutopilotExit — tool name and required", () => {
+    const state = { exited: false }
+    const tool = makeAutopilotExit(state)
+    expect(tool.definition.function.name).toBe("autopilot_exit")
+    expect(tool.definition.function.parameters.required).toEqual([])
+  })
+
+  test("makeAutopilotExit — execute sets exited and returns string", async () => {
+    const state = { exited: false }
+    const tool = makeAutopilotExit(state)
+    const result = await tool.execute({})
+    expect(typeof result).toBe("string")
+    expect(state.exited).toBe(true)
+  })
+
+  test("AUTOPILOT_NUDGE — is string, starts/ends with system-reminder tags, contains key phrases", () => {
+    expect(typeof AUTOPILOT_NUDGE).toBe("string")
+    expect(AUTOPILOT_NUDGE.trimStart().startsWith("<system-reminder>")).toBe(true)
+    expect(AUTOPILOT_NUDGE.trimEnd().endsWith("</system-reminder>")).toBe(true)
+    expect(AUTOPILOT_NUDGE).toContain("autopilot_exit")
+    expect(AUTOPILOT_NUDGE).toContain("stop planning and start implementing")
+  })
+
+  test("MAX_AUTOPILOT_REFLECTIONS === 50", () => {
+    expect(MAX_AUTOPILOT_REFLECTIONS).toBe(50)
+  })
+
+  test("AUTOPILOT_SUMMARY_PROMPT contains 'summarize'", () => {
+    expect(AUTOPILOT_SUMMARY_PROMPT).toContain("summarize")
+  })
 })
