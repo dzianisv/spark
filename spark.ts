@@ -1162,7 +1162,9 @@ function makePasteFilter(): Transform {
             pasteBuf += s.slice(0, end)
             out += pasteBuf.replace(/\n/g, "\x00") + "\n"
             pasteBuf = ""; pasting = false
-            s = s.slice(end + BP_END.length)
+            // consume one trailing \n (Enter pressed after paste) to avoid empty submission
+            const after = s.slice(end + BP_END.length)
+            s = after.startsWith("\n") ? after.slice(1) : after
           }
         } else {
           const start = s.indexOf(BP_START)
