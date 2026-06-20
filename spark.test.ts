@@ -774,27 +774,27 @@ describe("compaction", () => {
   }, TIMEOUT)
 })
 
-// ── ollamaChat think-retry tests ─────────────────────────────────────────────
-// Uses a real Bun HTTP server to mock the Ollama API — tests the actual retry
-// path in ollamaChatRaw/ollamaChat without needing qwen3-coder installed.
+// ── ollamaChat capability-probe tests ────────────────────────────────────────
+// Uses a real Bun HTTP server to mock Ollama's /api/show and /api/chat.
 
 function makeOllamaStreamLine(content: string, done = false): string {
-  return JSON.stringify({ message: { role: "assistant", content, thinking: "" }, done }) + "\n"
+  return JSON.stringify({ message: { role: "assistant", content }, done }) + "\n"
 }
 
-describe("ollamaChat think retry", () => {
-  test("retries with think:false when Ollama rejects think:true", async () => {
-    let attempts = 0
-    const server = Bun.serve({
+describe("ollamaChat capability probe", () => {
+  function makeMockServer(thinkingSupported: boolean) {
+    return Bun.serve({
       port: 0,
-      fetch(req) {
-        return req.json().then((body: Record<string, unknown>) => {
-          attempts++
-          if (body.think === true) {
-            return new Response(
-              JSON.stringify({ error: "model does not support think parameter" }),
-              { status: 400, headers: { "Content-Type": "application/json" } },
-            )
+      async fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === "/api/show") {
+          const caps = thinkingSupported ? ["completion", "thinking"] : ["completion"]
+          return new Response(JSON.stringify({ capabilities: caps }), { headers: { "Content-Type": "application/json" } })
+        }
+        if (url.pathname === "/api/chat") {
+          const body = await req.json() as Record<string, unknown>
+          if (body.think && !thinkingSupported) {
+            return new Response(JSON.stringify({ error: "model does not support think" }), { status: 400 })
           }
           const stream = new ReadableStream({
             start(controller) {
@@ -804,22 +804,20 @@ describe("ollamaChat think retry", () => {
             },
           })
           return new Response(stream, { headers: { "Content-Type": "application/x-ndjson" } })
-        })
+        }
+        return new Response("not found", { status: 404 })
       },
     })
+  }
 
-    // spark.ts reads process.env.OLLAMA_URL via getOllamaUrl() at call time — override here
+  test("sends think:true for thinking-capable model", async () => {
+    const server = makeMockServer(true)
     const origUrl = process.env.OLLAMA_URL
     process.env.OLLAMA_URL = `http://localhost:${server.port}`
     try {
-      const reply = await sparkOllamaChat(
-        "test-model",
-        [{ role: "user", content: "hi" }],
-        [],
-      )
+      const reply = await sparkOllamaChat("thinking-model", [{ role: "user", content: "hi" }], [])
       expect(reply.role).toBe("assistant")
       expect(reply.content).toBe("ok")
-      expect(attempts).toBe(2) // first think:true (400) then think:false (200)
     } finally {
       if (origUrl !== undefined) process.env.OLLAMA_URL = origUrl
       else delete process.env.OLLAMA_URL
@@ -827,28 +825,49 @@ describe("ollamaChat think retry", () => {
     }
   }, 10_000)
 
-  test("succeeds with think:true model — no regression (real Ollama)", async () => {
-    const models = await getModels()
-    if (models.length === 0) { console.log("SKIP: no Ollama models"); return }
-    const model = models.find(m => m.toLowerCase().includes("qwen3")) ?? models[0]
-    const reply = await sparkOllamaChat(
-      model,
-      [{ role: "user", content: "Reply with exactly: ok" }],
-      [],
-    )
-    expect(reply.role).toBe("assistant")
-    expect(reply.content.length).toBeGreaterThan(0)
-  }, 60_000)
+  test("sends no think param for non-thinking model (e.g. qwen3-coder)", async () => {
+    const server = makeMockServer(false)
+    const origUrl = process.env.OLLAMA_URL
+    process.env.OLLAMA_URL = `http://localhost:${server.port}`
+    try {
+      const reply = await sparkOllamaChat("non-thinking-model", [{ role: "user", content: "hi" }], [])
+      expect(reply.role).toBe("assistant")
+      expect(reply.content).toBe("ok")
+    } finally {
+      if (origUrl !== undefined) process.env.OLLAMA_URL = origUrl
+      else delete process.env.OLLAMA_URL
+      server.stop()
+    }
+  }, 10_000)
 
-  test("succeeds with qwen3-coder via auto-retry (real Ollama, skipped if not installed)", async () => {
+  test("real Ollama: qwen3 has thinking capability, smollm does not", async () => {
     const models = await getModels()
-    const coderModel = models.find(m => m.toLowerCase().includes("qwen3-coder"))
-    if (!coderModel) { console.log("SKIP: qwen3-coder not installed"); return }
-    const reply = await sparkOllamaChat(
-      coderModel,
-      [{ role: "user", content: "Reply with exactly: ok" }],
-      [],
-    )
+    const qwen3 = models.find(m => m.startsWith("qwen3:") && !m.includes("coder"))
+    const smol = models.find(m => m.includes("smollm"))
+    if (qwen3) {
+      const res = await fetch(`${process.env.OLLAMA_URL ?? "http://localhost:11434"}/api/show`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: qwen3 }),
+      })
+      const data = await res.json() as { capabilities?: string[] }
+      expect(data.capabilities ?? []).toContain("thinking")
+    }
+    if (smol) {
+      const res = await fetch(`${process.env.OLLAMA_URL ?? "http://localhost:11434"}/api/show`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: smol }),
+      })
+      const data = await res.json() as { capabilities?: string[] }
+      expect(data.capabilities ?? []).not.toContain("thinking")
+    }
+    if (!qwen3 && !smol) console.log("SKIP: neither qwen3 nor smollm installed")
+  }, 10_000)
+
+  test("real Ollama: ollamaChat works with qwen3 (thinking-capable)", async () => {
+    const models = await getModels()
+    const model = models.find(m => m.startsWith("qwen3:") && !m.includes("coder")) ?? models[0]
+    if (!model) { console.log("SKIP: no models"); return }
+    const reply = await sparkOllamaChat(model, [{ role: "user", content: "Reply with exactly: ok" }], [])
     expect(reply.role).toBe("assistant")
     expect(reply.content.length).toBeGreaterThan(0)
   }, 60_000)
