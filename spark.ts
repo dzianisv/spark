@@ -814,6 +814,52 @@ async function getSkillDescriptions(skillMap: Map<string, string>): Promise<stri
   return lines.join("\n")
 }
 
+// ── Docker Sandbox ───────────────────────────────────────────────────────────
+
+async function spawnSandbox(): Promise<void> {
+  const scriptPath = import.meta.path          // absolute path to spark.ts on host
+  const scriptDir = dirname(scriptPath)
+  const cwd = resolve(process.cwd())
+
+  // Rewrite localhost/127.0.0.1 in OLLAMA_URL to Docker's host alias
+  const hostOllamaUrl = process.env.OLLAMA_URL ?? "http://localhost:11434"
+  const dockerOllamaUrl = hostOllamaUrl.replace(/localhost|127\.0\.0\.1/g, "host.docker.internal")
+
+  const volumes = [`${cwd}:/workspace`]
+  let containerScript: string
+
+  if (scriptDir === cwd) {
+    containerScript = `/workspace/${basename(scriptPath)}`
+  } else {
+    // spark.ts lives outside the working directory — mount its dir separately
+    volumes.push(`${scriptDir}:/spark`)
+    containerScript = `/spark/${basename(scriptPath)}`
+  }
+
+  const dockerArgs = [
+    "run", "--rm", "-it",
+    "--add-host=host.docker.internal:host-gateway",  // Linux compat; macOS Docker Desktop has it built-in
+    "-e", `OLLAMA_URL=${dockerOllamaUrl}`,
+    "-e", "SPARK_SANDBOX=1",
+    ...volumes.flatMap(v => ["-v", v]),
+    "-w", "/workspace",
+    "oven/bun:alpine",
+    "bun", containerScript,
+  ]
+
+  console.log(`\x1b[90m[sandbox] docker ${dockerArgs.join(" ")}\x1b[0m\n`)
+
+  await new Promise<void>((resolve) => {
+    const proc = spawn("docker", dockerArgs, { stdio: "inherit" })
+    proc.on("close", () => resolve())
+    proc.on("error", (err) => {
+      console.error(`\x1b[31mFailed to start Docker: ${err.message}\x1b[0m`)
+      console.error(`\x1b[90mIs Docker running? Try: docker info\x1b[0m`)
+      resolve()
+    })
+  })
+}
+
 // ── Agent Instructions Loader ────────────────────────────────────────────────
 
 async function loadAgentInstructions(): Promise<string> {
@@ -929,7 +975,9 @@ const COLORS = {
 function printHeader(model: string, skillCount: number) {
   console.log(`${COLORS.cyan}${COLORS.bold}spark${COLORS.reset} ${COLORS.dim}— AI coding agent${COLORS.reset}`)
   console.log(`${COLORS.dim}Model:${COLORS.reset} ${model}  ${COLORS.dim}Skills:${COLORS.reset} ${skillCount}  ${COLORS.dim}Dir:${COLORS.reset} ${process.cwd()}`)
-  console.log(`${COLORS.dim}Commands: /models /clear /compact /goal /autopilot /quit${COLORS.reset}`)
+  const inSandbox = process.env.SPARK_SANDBOX === "1"
+  const sandboxTag = inSandbox ? `  \x1b[33m[sandbox]\x1b[0m` : ""
+  console.log(`${COLORS.dim}Commands: /models /clear /compact /goal /autopilot /quit${COLORS.reset}${sandboxTag}`)
   console.log()
 }
 
@@ -1033,6 +1081,12 @@ export async function checkGoal(model: string, goal: string, messages: Message[]
 }
 
 async function main() {
+  // Docker sandbox: re-spawn inside Alpine container then exit
+  if (process.argv.includes("--sandbox")) {
+    await spawnSandbox()
+    process.exit(0)
+  }
+
   // 1. Check Ollama
   const models = await ollamaModels()
   if (models.length === 0) {
