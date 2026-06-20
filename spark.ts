@@ -817,20 +817,67 @@ async function getSkillDescriptions(skillMap: Map<string, string>): Promise<stri
 // ── Agent Instructions Loader ────────────────────────────────────────────────
 
 async function loadAgentInstructions(): Promise<string> {
-  const paths = [join(homedir(), ".agents", "agents.md"), join(process.cwd(), "agents.md")]
   const parts: string[] = []
 
-  for (const p of paths) {
+  // Global instructions first (lowest precedence)
+  const globalPaths = [
+    join(homedir(), ".agents", "AGENTS.md"),
+    join(homedir(), ".agents", "agents.md"),
+  ]
+  for (const p of globalPaths) {
     const content = await readFile(p, "utf-8").catch(() => null)
-    if (content) parts.push(`# Instructions from: ${p}\n\n${content}`)
+    if (content) { parts.push(`# ${p}\n\n${content}`); break }
   }
+
+  // Walk up from cwd looking for AGENTS.md / CLAUDE.md (project beats parent)
+  const candidates = ["AGENTS.md", "CLAUDE.md", "agents.md"]
+  const found: string[] = []
+  let dir = process.cwd()
+  const stop = homedir()
+  while (dir !== stop && dir !== dirname(dir)) {
+    for (const name of candidates) {
+      const p = join(dir, name)
+      const content = await readFile(p, "utf-8").catch(() => null)
+      if (content) { found.unshift(`# ${p}\n\n${content}`); break }
+    }
+    dir = dirname(dir)
+  }
+  parts.push(...found)
 
   return parts.join("\n\n---\n\n")
 }
 
+// ── Git Context ──────────────────────────────────────────────────────────────
+
+async function getGitContext(cwd: string): Promise<string> {
+  const run = (cmd: string) =>
+    new Promise<string>((res) => {
+      const proc = spawn("sh", ["-c", cmd], { cwd, stdio: ["ignore", "pipe", "pipe"] })
+      const chunks: Buffer[] = []
+      proc.stdout.on("data", (d: Buffer) => chunks.push(d))
+      proc.stderr.on("data", (d: Buffer) => chunks.push(d))
+      proc.on("close", () => res(Buffer.concat(chunks).toString("utf-8").trim()))
+      proc.on("error", () => res(""))
+    })
+
+  const [branch, status, log] = await Promise.all([
+    run("git branch --show-current 2>/dev/null"),
+    run("git status --short 2>/dev/null | head -20"),
+    run("git log --oneline -5 2>/dev/null"),
+  ])
+
+  if (!branch && !status) return "" // not a git repo
+
+  const parts: string[] = []
+  if (branch) parts.push(`Branch: ${branch}`)
+  if (status) parts.push(`Changed files:\n${status}`)
+  if (log) parts.push(`Recent commits:\n${log}`)
+  return parts.join("\n")
+}
+
 // ── System Prompt Builder ────────────────────────────────────────────────────
 
-function buildSystemPrompt(agentInstructions: string, skillList: string, model: string): string {
+function buildSystemPrompt(agentInstructions: string, skillList: string, model: string, gitContext: string): string {
   const cwd = process.cwd()
   const today = new Date().toLocaleDateString("en-CA") // YYYY-MM-DD
   const platform = process.platform
@@ -841,7 +888,7 @@ function buildSystemPrompt(agentInstructions: string, skillList: string, model: 
   Model: ${model}
   Working directory: ${cwd}
   Platform: ${platform}
-  Today: ${today}
+  Today: ${today}${gitContext ? `\n${gitContext.split("\n").map(l => `  ${l}`).join("\n")}` : ""}
 </env>
 
 ## Behavior
@@ -997,14 +1044,15 @@ async function main() {
     currentModel = pickBestModel(models)
   }
 
-  // 2. Load skills
-  const skillMap = await scanSkills()
+  // 2. Load skills, agent instructions, and git context in parallel
+  const [skillMap, agentInstructions, gitContext] = await Promise.all([
+    scanSkills(),
+    loadAgentInstructions(),
+    getGitContext(process.cwd()),
+  ])
   const skillList = await getSkillDescriptions(skillMap)
 
-  // 3. Load agent instructions
-  const agentInstructions = await loadAgentInstructions()
-
-  // 4. Build tools (core tools first, then system prompt, then Task uses lazy ref)
+  // 3. Build tools (core tools first, then system prompt, then Task uses lazy ref)
   const readFileTool = makeReadFile()
   const writeFileTool = makeWriteFile()
   const bashTool = makeBash()
@@ -1014,14 +1062,10 @@ async function main() {
   const loadSkillTool = makeLoadSkill(skillMap)
   const coreTools = [readFileTool, writeFileTool, bashTool, evalTool, globTool, grepTool, loadSkillTool]
 
-  // 5. Build system prompt from core tool defs (Task added manually to description)
-  const allToolDefs = [
-    ...coreTools.map((t) => t.definition),
-    makeTask("", "", []).definition, // just for the schema/description
-  ]
-  const systemPrompt = buildSystemPrompt(agentInstructions, skillList, currentModel)
+  // 4. Build system prompt
+  const systemPrompt = buildSystemPrompt(agentInstructions, skillList, currentModel, gitContext)
 
-  // 6. Build full tool set with Task having a lazy systemPrompt reference
+  // 5. Build full tool set with Task having a lazy systemPrompt reference
   const buildTools = () => {
     const taskTool = makeTask(currentModel, systemPrompt, coreTools)
     return [...coreTools, taskTool]
