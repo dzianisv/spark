@@ -1213,11 +1213,13 @@ async function main() {
     })
 
   // Collect lines: bare Enter submits; trailing \ continues to next line.
+  // Slash commands are always single-line — never continued.
   const promptMultiline = async (): Promise<string> => {
     const lines: string[] = []
     while (true) {
       const line = await prompt()
-      if (line.endsWith("\\")) {
+      const isCommand = lines.length === 0 && line.trimStart().startsWith("/")
+      if (!isCommand && line.endsWith("\\")) {
         lines.push(line.slice(0, -1))
         process.stdout.write(`${COLORS.green}... ${COLORS.reset}`)
       } else {
@@ -1228,21 +1230,30 @@ async function main() {
   }
 
   // Open $EDITOR on a temp file and return its contents.
+  // Rejects if the editor exits non-zero (cancelled) or cannot be spawned.
   const openEditor = (): Promise<string> =>
     new Promise((res, rej) => {
       const tmp = join(homedir(), `.spark_edit_${Date.now()}.txt`)
       const editor = process.env.EDITOR ?? process.env.VISUAL ?? "vi"
       const child = spawn(editor, [tmp], { stdio: "inherit" })
-      child.on("error", rej)
-      child.on("close", () =>
+      let errored = false
+      child.on("error", (err) => { errored = true; rej(err) })
+      child.on("close", (code) => {
+        if (errored) return // error event already rejected
+        if (code !== 0) return rej(new Error(`editor exited ${code}`))
         readFile(tmp, "utf8")
           .then((t) => unlink(tmp).catch(() => {}).then(() => res(t.trim())))
-          .catch(rej),
-      )
+          .catch(rej)
+      })
     })
 
+  // Exit cleanly on Ctrl+C when waiting at the prompt (no agent turn active).
+  const promptSigint = () => { process.stdout.write("\n"); rl.close(); process.exit(0) }
+
   while (true) {
+    process.once("SIGINT", promptSigint)
     const input = await promptMultiline()
+    process.removeListener("SIGINT", promptSigint)
     const trimmed = input.trim()
     if (!trimmed) continue
 
