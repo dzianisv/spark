@@ -579,15 +579,10 @@ describe("goal supervisor", () => {
     expect(result.feedback).toBe("Run the tests first")
   })
 
-  test("parseVerdict — JSON wrapped in markdown fences", () => {
-    const result = parseVerdict('```json\n{"reached":true,"feedback":""}\n```')
+  test("parseVerdict — missing feedback field defaults to empty string", () => {
+    const result = parseVerdict('{"reached":true}')
     expect(result.reached).toBe(true)
-  })
-
-  test("parseVerdict — JSON embedded in prose", () => {
-    const result = parseVerdict('Based on my analysis, here is my verdict: {"reached":false,"feedback":"Need to commit changes"} I hope that helps.')
-    expect(result.reached).toBe(false)
-    expect(result.feedback).toBe("Need to commit changes")
+    expect(result.feedback).toBe("")
   })
 
   test("parseVerdict — garbage/non-JSON input returns fail-safe", () => {

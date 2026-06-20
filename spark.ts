@@ -79,11 +79,14 @@ export async function ollamaChat(
   messages: Message[],
   tools: ToolDef[],
   callbacks?: StreamCallbacks,
+  format?: unknown,
 ): Promise<Message> {
+  const body: Record<string, unknown> = { model, messages, tools, stream: true, think: format ? false : true }
+  if (format) { body.format = format; body.options = { temperature: 0 } }
   const res = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, tools, stream: true, think: true }),
+    body: JSON.stringify(body),
   })
   if (!res.ok) throw new Error(`Ollama error ${res.status}: ${await res.text()}`)
 
@@ -813,17 +816,21 @@ async function selectModel(models: string[], current: string, rl: ReturnType<typ
 
 export interface GoalVerdict { reached: boolean; feedback: string }
 
+const VERDICT_SCHEMA = {
+  type: "object",
+  properties: {
+    reached: { type: "boolean" },
+    feedback: { type: "string" },
+  },
+  required: ["reached", "feedback"],
+} as const
+
 export function parseVerdict(text: string): GoalVerdict {
-  const jsonMatch = text.match(/\{[\s\S]*\}/)
-  if (!jsonMatch) return { reached: false, feedback: "" }
   try {
-    const parsed = JSON.parse(jsonMatch[0])
-    return {
-      reached: Boolean(parsed.reached),
-      feedback: String(parsed.feedback ?? ""),
-    }
+    const parsed = JSON.parse(text)
+    return { reached: Boolean(parsed.reached), feedback: String(parsed.feedback ?? "") }
   } catch {
-    return { reached: false, feedback: "" }
+    return { reached: false, feedback: "" } // fail-safe: keep working rather than falsely declare done
   }
 }
 
@@ -838,7 +845,7 @@ export async function checkGoal(model: string, goal: string, messages: Message[]
   const reply = await ollamaChat(model, [
     { role: "system", content: judgeSystem },
     { role: "user", content: judgeUser },
-  ], [], undefined)
+  ], [], undefined, VERDICT_SCHEMA)
   return parseVerdict(reply.content ?? "")
 }
 
@@ -1039,7 +1046,13 @@ async function main() {
         break supervise
       }
       goalChecks++
-      const verdict = await checkGoal(currentModel, goal, messages)
+      let verdict: GoalVerdict
+      try {
+        verdict = await checkGoal(currentModel, goal, messages)
+      } catch (err: unknown) {
+        console.log(`⚠ supervisor check failed: ${err instanceof Error ? err.message : String(err)} — stopping`)
+        break supervise
+      }
       if (verdict.reached) { console.log(`✓ supervisor: goal reached`); break supervise }
       console.log(`↻ supervisor (${goalChecks}/${MAX_GOAL_CHECKS}): ${verdict.feedback}`)
       messages.push({ role: "user", content: `[supervisor] Goal not yet reached. ${verdict.feedback} Keep working toward the goal: ${goal}` })
