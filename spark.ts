@@ -68,7 +68,24 @@ interface Tool {
 // ── Ollama Client ────────────────────────────────────────────────────────────
 
 const getOllamaUrl = () => process.env.OLLAMA_URL ?? "http://localhost:11434"
-const noThinkModels = new Set<string>()
+const modelCapabilityCache = new Map<string, string[]>()
+
+async function ollamaCapabilities(model: string): Promise<string[]> {
+  const cached = modelCapabilityCache.get(model)
+  if (cached) return cached
+  try {
+    const res = await fetch(`${getOllamaUrl()}/api/show`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: model }),
+    })
+    if (!res.ok) return []
+    const data = (await res.json()) as { capabilities?: string[] }
+    const caps = data.capabilities ?? []
+    modelCapabilityCache.set(model, caps)
+    return caps
+  } catch { return [] }
+}
 
 interface StreamCallbacks {
   onThinking?: (chunk: string) => void
@@ -83,7 +100,8 @@ async function ollamaChatRaw(
   format: unknown,
   think: boolean,
 ): Promise<Message> {
-  const body: Record<string, unknown> = { model, messages, tools, stream: true, think }
+  const body: Record<string, unknown> = { model, messages, tools, stream: true }
+  if (think) body.think = true
   if (format) { body.format = format; body.options = { temperature: 0 } }
   const res = await fetch(`${getOllamaUrl()}/api/chat`, {
     method: "POST",
@@ -92,7 +110,7 @@ async function ollamaChatRaw(
   })
   if (!res.ok) {
     const text = await res.text()
-    throw Object.assign(new Error(`Ollama error ${res.status}: ${text}`), { ollamaBody: text, ollamaStatus: res.status })
+    throw new Error(`Ollama error ${res.status}: ${text}`)
   }
 
   const reader = res.body?.getReader()
@@ -165,19 +183,9 @@ export async function ollamaChat(
   callbacks?: StreamCallbacks,
   format?: unknown,
 ): Promise<Message> {
-  const think = !format && !noThinkModels.has(model)
-  try {
-    return await ollamaChatRaw(model, messages, tools, callbacks, format, think)
-  } catch (e: unknown) {
-    const err = e as { ollamaBody?: string; ollamaStatus?: number }
-    const body = err.ollamaBody ?? ""
-    const status = err.ollamaStatus
-    if (think && status === 400 && body.includes("think")) {
-      noThinkModels.add(model)
-      return ollamaChatRaw(model, messages, tools, callbacks, format, false)
-    }
-    throw e
-  }
+  const caps = await ollamaCapabilities(model)
+  const think = !format && caps.includes("thinking")
+  return ollamaChatRaw(model, messages, tools, callbacks, format, think)
 }
 
 async function ollamaModels(): Promise<string[]> {
