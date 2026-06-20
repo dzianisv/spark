@@ -829,20 +829,26 @@ async function loadAgentInstructions(): Promise<string> {
     if (content) { parts.push(`# ${p}\n\n${content}`); break }
   }
 
-  // Walk up from cwd looking for AGENTS.md / CLAUDE.md (project beats parent)
+  // Walk up from cwd to homedir (inclusive) looking for AGENTS.md / CLAUDE.md
+  // Child dirs beat parents: we collect bottom-up then reverse before pushing.
   const candidates = ["AGENTS.md", "CLAUDE.md", "agents.md"]
   const found: string[] = []
+  const home = homedir()
   let dir = process.cwd()
-  const stop = homedir()
-  while (dir !== stop && dir !== dirname(dir)) {
-    for (const name of candidates) {
-      const p = join(dir, name)
-      const content = await readFile(p, "utf-8").catch(() => null)
-      if (content) { found.unshift(`# ${p}\n\n${content}`); break }
+  // Only walk within the homedir subtree to avoid reading unrelated system configs
+  if (dir.startsWith(home)) {
+    while (dir !== dirname(dir)) {
+      for (const name of candidates) {
+        const p = join(dir, name)
+        const content = await readFile(p, "utf-8").catch(() => null)
+        if (content) { found.push(`# ${p}\n\n${content}`); break }
+      }
+      if (dir === home) break
+      dir = dirname(dir)
     }
-    dir = dirname(dir)
+    // found is [cwd, parent, ..., home] — reverse so child instructions come last (highest precedence)
+    parts.push(...found.reverse())
   }
-  parts.push(...found)
 
   return parts.join("\n\n---\n\n")
 }
@@ -852,12 +858,12 @@ async function loadAgentInstructions(): Promise<string> {
 async function getGitContext(cwd: string): Promise<string> {
   const run = (cmd: string) =>
     new Promise<string>((res) => {
-      const proc = spawn("sh", ["-c", cmd], { cwd, stdio: ["ignore", "pipe", "pipe"] })
+      const proc = spawn("sh", ["-c", cmd], { cwd, stdio: ["ignore", "pipe", "ignore"] }) // ignore stderr — only stdout
       const chunks: Buffer[] = []
       proc.stdout.on("data", (d: Buffer) => chunks.push(d))
-      proc.stderr.on("data", (d: Buffer) => chunks.push(d))
-      proc.on("close", () => res(Buffer.concat(chunks).toString("utf-8").trim()))
-      proc.on("error", () => res(""))
+      const timer = setTimeout(() => { proc.kill(); res("") }, 3000) // 3s timeout — git can hang on slow NFS/credentials
+      proc.on("close", () => { clearTimeout(timer); res(Buffer.concat(chunks).toString("utf-8").trim()) })
+      proc.on("error", () => { clearTimeout(timer); res("") })
     })
 
   const [branch, status, log] = await Promise.all([
@@ -866,10 +872,11 @@ async function getGitContext(cwd: string): Promise<string> {
     run("git log --oneline -5 2>/dev/null"),
   ])
 
-  if (!branch && !status) return "" // not a git repo
+  if (!branch && !status && !log) return "" // not a git repo
 
   const parts: string[] = []
   if (branch) parts.push(`Branch: ${branch}`)
+  else parts.push("Branch: (detached HEAD)")
   if (status) parts.push(`Changed files:\n${status}`)
   if (log) parts.push(`Recent commits:\n${log}`)
   return parts.join("\n")
@@ -888,7 +895,7 @@ function buildSystemPrompt(agentInstructions: string, skillList: string, model: 
   Model: ${model}
   Working directory: ${cwd}
   Platform: ${platform}
-  Today: ${today}${gitContext ? `\n${gitContext.split("\n").map(l => `  ${l}`).join("\n")}` : ""}
+  Today: ${today}${gitContext ? `\n${gitContext.replace(/</g, "&lt;").split("\n").map(l => `  ${l}`).join("\n")}` : ""}
 </env>
 
 ## Behavior
