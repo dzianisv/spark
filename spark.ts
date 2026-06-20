@@ -349,6 +349,14 @@ function truncateOutput(output: string, max = 30_000): string {
   return output.slice(0, half) + `\n\n...(${output.length - max} characters omitted)...\n\n` + output.slice(-half)
 }
 
+function truncateLines(output: string, maxLines = 200): string {
+  const lines = output.split("\n")
+  if (lines.length <= maxLines) return output
+  const kept = lines.slice(0, maxLines)
+  const omitted = lines.length - maxLines
+  return kept.join("\n") + `\n[...${omitted} lines omitted]`
+}
+
 function lineTrimmedMatch(content: string, find: string): { start: number; end: number } | null {
   const contentLines = content.split("\n")
   const findLines = find.split("\n")
@@ -378,7 +386,7 @@ function makeReadFile(): Tool {
       function: {
         name: "ReadFile",
         description:
-          "Read a file from disk. Returns numbered lines. For directories, lists entries. Use offset/limit for large files.",
+          "Read a file from disk. Returns numbered lines with a header showing total line count and current window. For directories, lists entries. Use offset/limit for large files.",
         parameters: {
           type: "object",
           properties: {
@@ -418,10 +426,32 @@ function makeReadFile(): Tool {
 
       const total = lines.length
       const shown = slice.length
-      const header = shown < total ? `(Showing lines ${offset}-${offset + shown - 1} of ${total})` : ""
-      return truncateOutput(numbered.join("\n") + (header ? `\n${header}` : ""))
+      const end = offset - 1 + shown
+      const header = `# ${filePath} | ${total} lines total | showing ${offset}-${end}`
+      return truncateOutput(header + "\n" + numbered.join("\n"))
     },
   }
+}
+
+async function checkedWrite(filePath: string, content: string): Promise<string | null> {
+  const ext = filePath.split(".").pop()?.toLowerCase()
+  if (ext === "ts" || ext === "tsx" || ext === "js" || ext === "jsx") {
+    const tmpPath = filePath + ".spark_check_tmp"
+    try {
+      await writeFile(tmpPath, content, "utf-8")
+      const checkProc = Bun.spawn(["bun", "--check", tmpPath], { stdout: "pipe", stderr: "pipe" })
+      const checkErr = await new Response(checkProc.stderr).text()
+      const checkCode = await checkProc.exited
+      await unlink(tmpPath).catch(() => {})
+      if (checkCode !== 0) {
+        const errMsg = checkErr.replace(new RegExp(tmpPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), filePath)
+        return `Error: syntax check failed before writing ${filePath}:\n${errMsg.slice(0, 1000)}`
+      }
+    } catch {
+      await unlink(tmpPath).catch(() => {})
+    }
+  }
+  return null
 }
 
 function makeWriteFile(): Tool {
@@ -459,6 +489,8 @@ function makeWriteFile(): Tool {
 
         if (existing === null) {
           if (oldStr === "") {
+            const checkErr = await checkedWrite(filePath, newStr)
+            if (checkErr) return checkErr
             await writeFile(filePath, newStr, "utf-8")
             return `Created new file: ${filePath}`
           }
@@ -470,6 +502,8 @@ function makeWriteFile(): Tool {
 
         if (args.replaceAll) {
           const result = existing.replaceAll(oldStr, newStr)
+          const checkErr = await checkedWrite(filePath, result)
+          if (checkErr) return checkErr
           await writeFile(filePath, result, "utf-8")
           const count = (existing.split(oldStr).length - 1)
           return `Replaced ${count} occurrence(s) in ${filePath}`
@@ -482,6 +516,8 @@ function makeWriteFile(): Tool {
           if (firstIdx !== lastIdx)
             return `Error: found multiple matches for oldString. Use replaceAll or provide more context to make it unique.`
           const result = existing.slice(0, firstIdx) + newStr + existing.slice(firstIdx + oldStr.length)
+          const checkErr = await checkedWrite(filePath, result)
+          if (checkErr) return checkErr
           await writeFile(filePath, result, "utf-8")
           const oldLines = oldStr.split("\n").length
           const newLines = newStr.split("\n").length
@@ -492,6 +528,8 @@ function makeWriteFile(): Tool {
         const fuzzy = lineTrimmedMatch(existing, oldStr)
         if (fuzzy) {
           const result = existing.slice(0, fuzzy.start) + newStr + existing.slice(fuzzy.end)
+          const checkErr = await checkedWrite(filePath, result)
+          if (checkErr) return checkErr
           await writeFile(filePath, result, "utf-8")
           const oldLines = oldStr.split("\n").length
           const newLines = newStr.split("\n").length
@@ -504,6 +542,8 @@ function makeWriteFile(): Tool {
       // Full write mode
       const content = String(args.content ?? "")
       const existing = await readFile(filePath, "utf-8").catch(() => null)
+      const checkErr = await checkedWrite(filePath, content)
+      if (checkErr) return checkErr
       await writeFile(filePath, content, "utf-8")
 
       if (existing === null) return `Created new file: ${filePath} (${content.split("\n").length} lines)`
@@ -555,7 +595,7 @@ function makeBash(): Tool {
         proc.on("close", (code) => {
           clearTimeout(timer)
           const output = Buffer.concat(chunks).toString("utf-8")
-          const truncated = truncateOutput(output)
+          const truncated = truncateOutput(truncateLines(output))
           const prefix = code !== 0 ? `[exit code: ${code}]\n` : ""
           done(prefix + truncated)
         })
@@ -674,7 +714,7 @@ function makeGrep(): Tool {
         const exitCode = await proc.exited
         if (exitCode === 1) return "No matches found."
         if (!output.trim()) return "No matches found."
-        return truncateOutput(output.trim())
+        return truncateLines(output.trim())
       } catch {
         return "Error: ripgrep (rg) not found. Install with: brew install ripgrep"
       }
