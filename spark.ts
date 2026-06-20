@@ -67,28 +67,32 @@ interface Tool {
 
 // ── Ollama Client ────────────────────────────────────────────────────────────
 
-const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434"
+const getOllamaUrl = () => process.env.OLLAMA_URL ?? "http://localhost:11434"
 
 interface StreamCallbacks {
   onThinking?: (chunk: string) => void
   onContent?: (chunk: string) => void
 }
 
-export async function ollamaChat(
+async function ollamaChatRaw(
   model: string,
   messages: Message[],
   tools: ToolDef[],
-  callbacks?: StreamCallbacks,
-  format?: unknown,
+  callbacks: StreamCallbacks | undefined,
+  format: unknown,
+  think: boolean,
 ): Promise<Message> {
-  const body: Record<string, unknown> = { model, messages, tools, stream: true, think: format ? false : true }
+  const body: Record<string, unknown> = { model, messages, tools, stream: true, think }
   if (format) { body.format = format; body.options = { temperature: 0 } }
-  const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+  const res = await fetch(`${getOllamaUrl()}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`Ollama error ${res.status}: ${await res.text()}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw Object.assign(new Error(`Ollama error ${res.status}: ${text}`), { ollamaBody: text, ollamaStatus: res.status })
+  }
 
   const reader = res.body?.getReader()
   if (!reader) throw new Error("No response body")
@@ -153,8 +157,29 @@ export async function ollamaChat(
   return result
 }
 
+export async function ollamaChat(
+  model: string,
+  messages: Message[],
+  tools: ToolDef[],
+  callbacks?: StreamCallbacks,
+  format?: unknown,
+): Promise<Message> {
+  const think = !format
+  try {
+    return await ollamaChatRaw(model, messages, tools, callbacks, format, think)
+  } catch (e: unknown) {
+    const err = e as { ollamaBody?: string; ollamaStatus?: number }
+    const body = err.ollamaBody ?? ""
+    const status = err.ollamaStatus
+    if (think && status === 400 && (body.includes("think") || body.includes("does not support"))) {
+      return ollamaChatRaw(model, messages, tools, callbacks, format, false)
+    }
+    throw e
+  }
+}
+
 async function ollamaModels(): Promise<string[]> {
-  const res = await fetch(`${OLLAMA_URL}/api/tags`)
+  const res = await fetch(`${getOllamaUrl()}/api/tags`)
   if (!res.ok) return []
   const data = (await res.json()) as { models: { name: string }[] }
   return data.models.map((m) => m.name)

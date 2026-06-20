@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+docker info &>/dev/null || { open -a Docker 2>/dev/null; echo "Waiting for Docker..."; until docker info &>/dev/null; do sleep 1; done; }; docker run --rm -it --add-host=host.docker.internal:host-gateway -e OLLAMA_URL=http://host.docker.internal:11434 -v "$(pwd):/workspace" -w /workspace oven/bun:alpine sh -c 'wget -qO /tmp/spark.ts https://raw.githubusercontent.com/dzianisv/spark/main/spark.ts && bun /tmp/spark.ts'

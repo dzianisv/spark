@@ -3,7 +3,7 @@
 // Requires: Ollama running with at least one model
 
 import { test, expect, beforeAll, describe } from "bun:test"
-import { parseVerdict, checkGoal, makeAutopilotExit, AUTOPILOT_NUDGE, MAX_AUTOPILOT_REFLECTIONS, AUTOPILOT_SUMMARY_PROMPT, estimateTokens, splitTurns, compactMessages, TAIL_TURNS } from "./spark.ts"
+import { parseVerdict, checkGoal, makeAutopilotExit, AUTOPILOT_NUDGE, MAX_AUTOPILOT_REFLECTIONS, AUTOPILOT_SUMMARY_PROMPT, estimateTokens, splitTurns, compactMessages, TAIL_TURNS, ollamaChat as sparkOllamaChat } from "./spark.ts"
 import type { Message as SparkMessage } from "./spark.ts"
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -772,4 +772,84 @@ describe("compaction", () => {
     expect(tailStart.role).toBe("user")
     expect(tailStart.content).toBe("How many tools does it define?")
   }, TIMEOUT)
+})
+
+// ── ollamaChat think-retry tests ─────────────────────────────────────────────
+// Uses a real Bun HTTP server to mock the Ollama API — tests the actual retry
+// path in ollamaChatRaw/ollamaChat without needing qwen3-coder installed.
+
+function makeOllamaStreamLine(content: string, done = false): string {
+  return JSON.stringify({ message: { role: "assistant", content, thinking: "" }, done }) + "\n"
+}
+
+describe("ollamaChat think retry", () => {
+  test("retries with think:false when Ollama rejects think:true", async () => {
+    let attempts = 0
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        return req.json().then((body: Record<string, unknown>) => {
+          attempts++
+          if (body.think === true) {
+            return new Response(
+              JSON.stringify({ error: "model does not support think parameter" }),
+              { status: 400, headers: { "Content-Type": "application/json" } },
+            )
+          }
+          const stream = new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(makeOllamaStreamLine("ok")))
+              controller.enqueue(new TextEncoder().encode(makeOllamaStreamLine("", true)))
+              controller.close()
+            },
+          })
+          return new Response(stream, { headers: { "Content-Type": "application/x-ndjson" } })
+        })
+      },
+    })
+
+    // spark.ts reads process.env.OLLAMA_URL via getOllamaUrl() at call time — override here
+    const origUrl = process.env.OLLAMA_URL
+    process.env.OLLAMA_URL = `http://localhost:${server.port}`
+    try {
+      const reply = await sparkOllamaChat(
+        "test-model",
+        [{ role: "user", content: "hi" }],
+        [],
+      )
+      expect(reply.role).toBe("assistant")
+      expect(reply.content).toBe("ok")
+      expect(attempts).toBe(2) // first think:true (400) then think:false (200)
+    } finally {
+      if (origUrl !== undefined) process.env.OLLAMA_URL = origUrl
+      else delete process.env.OLLAMA_URL
+      server.stop()
+    }
+  }, 10_000)
+
+  test("succeeds with think:true model — no regression (real Ollama)", async () => {
+    const models = await getModels()
+    if (models.length === 0) { console.log("SKIP: no Ollama models"); return }
+    const model = models.find(m => m.toLowerCase().includes("qwen3")) ?? models[0]
+    const reply = await sparkOllamaChat(
+      model,
+      [{ role: "user", content: "Reply with exactly: ok" }],
+      [],
+    )
+    expect(reply.role).toBe("assistant")
+    expect(reply.content.length).toBeGreaterThan(0)
+  }, 60_000)
+
+  test("succeeds with qwen3-coder via auto-retry (real Ollama, skipped if not installed)", async () => {
+    const models = await getModels()
+    const coderModel = models.find(m => m.toLowerCase().includes("qwen3-coder"))
+    if (!coderModel) { console.log("SKIP: qwen3-coder not installed"); return }
+    const reply = await sparkOllamaChat(
+      coderModel,
+      [{ role: "user", content: "Reply with exactly: ok" }],
+      [],
+    )
+    expect(reply.role).toBe("assistant")
+    expect(reply.content.length).toBeGreaterThan(0)
+  }, 60_000)
 })
