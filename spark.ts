@@ -640,6 +640,50 @@ function makeTask(
   }
 }
 
+// ── Autopilot ────────────────────────────────────────────────────────────────
+
+export const MAX_AUTOPILOT_REFLECTIONS = 50
+
+export const AUTOPILOT_NUDGE = `<system-reminder>
+Autopilot mode remains active. You have not called autopilot_exit yet.
+If you were planning, stop planning and start implementing.
+You aren't done until you have fully completed the task.
+
+Do not call autopilot_exit if:
+- You have open questions — make decisions and keep working
+- You hit an error — try to resolve it
+- There are remaining steps — complete them first
+
+Continue executing autonomously. Keep moving forward.
+</system-reminder>`
+
+export const AUTOPILOT_SUMMARY_PROMPT = "Autopilot completed. Briefly summarize what was accomplished."
+
+export function makeAutopilotExit(state: { exited: boolean }): Tool {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "autopilot_exit",
+        description:
+          "Call this ONLY when the task is fully complete to exit autopilot mode. Do not call it if you have open questions, hit a recoverable error, or have remaining steps.",
+        parameters: {
+          type: "object",
+          properties: {
+            summary: { type: "string", description: "Optional one-line summary of what was accomplished" },
+          },
+          required: [],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(_args: Record<string, unknown>): Promise<string> {
+      state.exited = true
+      return "Autopilot exit acknowledged. Provide a brief final summary."
+    },
+  }
+}
+
 // ── Skill Scanner ────────────────────────────────────────────────────────────
 
 async function scanSkills(): Promise<Map<string, string>> {
@@ -743,7 +787,7 @@ const COLORS = {
 function printHeader(model: string, skillCount: number) {
   console.log(`${COLORS.cyan}${COLORS.bold}spark${COLORS.reset} ${COLORS.dim}— AI coding agent${COLORS.reset}`)
   console.log(`${COLORS.dim}Model:${COLORS.reset} ${model}  ${COLORS.dim}Skills:${COLORS.reset} ${skillCount}  ${COLORS.dim}Dir:${COLORS.reset} ${process.cwd()}`)
-  console.log(`${COLORS.dim}Commands: /models /clear /goal /quit${COLORS.reset}`)
+  console.log(`${COLORS.dim}Commands: /models /clear /compact /goal /autopilot /quit${COLORS.reset}`)
   console.log()
 }
 
@@ -897,6 +941,7 @@ async function main() {
   if (goal) {
     messages[0].content += `\n\nCurrent goal: ${goal}`
   }
+  let autopilot = false
 
   printHeader(currentModel, skillMap.size)
 
@@ -952,14 +997,38 @@ async function main() {
       continue
     }
 
+    if (trimmed === "/autopilot") {
+      console.log(autopilot ? `autopilot: ON` : `autopilot: OFF`)
+      continue
+    }
+
+    let skipGenericPush = false
+
+    if (trimmed.startsWith("/autopilot ")) {
+      const arg = trimmed.slice("/autopilot ".length).trim()
+      if (arg === "off") {
+        autopilot = false
+        console.log(`autopilot OFF`)
+        continue
+      }
+      autopilot = true
+      console.log(`autopilot ON — running autonomously until autopilot_exit or ${MAX_AUTOPILOT_REFLECTIONS} reflections`)
+      messages.push({ role: "user", content: arg })
+      skipGenericPush = true
+      // fall through into the agent loop below by NOT continuing
+    }
+
     // Add user message
-    messages.push({ role: "user", content: trimmed })
+    if (!skipGenericPush) messages.push({ role: "user", content: trimmed })
 
     // Agent loop: call model, handle tool calls, repeat until text response
     const tools = buildTools()
+    const autopilotState = { exited: false, summarized: false }
+    if (autopilot) tools.push(makeAutopilotExit(autopilotState))
+    let reflections = 0
     const toolDefsForCall = tools.map((t) => t.definition)
     const toolMap = new Map(tools.map((t) => [t.definition.function.name, t]))
-    const MAX_TOOL_ROUNDS = 30
+    const MAX_TOOL_ROUNDS = autopilot ? 200 : 30
     const MAX_GOAL_CHECKS = 10
     let goalChecks = 0
 
@@ -993,6 +1062,12 @@ async function main() {
           // No tool calls → finalize streamed response
           if (!reply.tool_calls?.length) {
             if (contentStarted || thinkingStarted) process.stdout.write("\n\n")
+            if (autopilot && !autopilotState.exited && reflections < MAX_AUTOPILOT_REFLECTIONS) {
+              reflections++
+              console.log(`${COLORS.dim}↻ autopilot reflection ${reflections}/${MAX_AUTOPILOT_REFLECTIONS}${COLORS.reset}`)
+              messages.push({ role: "user", content: AUTOPILOT_NUDGE })
+              continue
+            }
             break
           }
 
@@ -1023,6 +1098,11 @@ async function main() {
             console.log(`${COLORS.dim}${preview}${COLORS.reset}`)
 
             messages.push({ role: "tool", content: result, tool_name: toolName, tool_call_id: call.id })
+          }
+          if (autopilotState.exited && !autopilotState.summarized) {
+            autopilotState.summarized = true
+            autopilot = false // exit returns to normal mode (blog: switch to build); re-arm with /autopilot
+            messages.push({ role: "user", content: AUTOPILOT_SUMMARY_PROMPT })
           }
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err)
