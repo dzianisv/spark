@@ -796,7 +796,6 @@ describe("ollamaChat think retry", () => {
               { status: 400, headers: { "Content-Type": "application/json" } },
             )
           }
-          // think:false — succeed with streaming response
           const stream = new ReadableStream({
             start(controller) {
               controller.enqueue(new TextEncoder().encode(makeOllamaStreamLine("ok")))
@@ -809,32 +808,18 @@ describe("ollamaChat think retry", () => {
       },
     })
 
+    // spark.ts reads process.env.OLLAMA_URL via getOllamaUrl() at call time — override here
     const origUrl = process.env.OLLAMA_URL
     process.env.OLLAMA_URL = `http://localhost:${server.port}`
-    // Re-import OLLAMA_URL is read at module level — call via dynamic env var trick
-    // sparkOllamaChat reads OLLAMA_URL from module scope, so we need to override it
-    // via the exported function which uses the module-level OLLAMA_URL constant.
-    // Instead, call the function directly with our server url by temporarily patching.
     try {
-      // The function reads process.env.OLLAMA_URL at module load time as a const.
-      // We test the retry logic directly by calling the raw HTTP ourselves.
-      // Verify the mock server itself works as expected first:
-      const r1 = await fetch(`http://localhost:${server.port}/api/chat`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "test", messages: [], tools: [], stream: true, think: true }),
-      })
-      expect(r1.status).toBe(400)
-      const r1body = await r1.json() as { error: string }
-      expect(r1body.error).toContain("think")
-
-      attempts = 0
-      const r2 = await fetch(`http://localhost:${server.port}/api/chat`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "test", messages: [], tools: [], stream: true, think: false }),
-      })
-      expect(r2.status).toBe(200)
-
-      expect(attempts).toBe(1) // only the think:false call
+      const reply = await sparkOllamaChat(
+        "test-model",
+        [{ role: "user", content: "hi" }],
+        [],
+      )
+      expect(reply.role).toBe("assistant")
+      expect(reply.content).toBe("ok")
+      expect(attempts).toBe(2) // first think:true (400) then think:false (200)
     } finally {
       if (origUrl !== undefined) process.env.OLLAMA_URL = origUrl
       else delete process.env.OLLAMA_URL
