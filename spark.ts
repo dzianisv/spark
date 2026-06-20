@@ -6,7 +6,7 @@ import { readdir, stat, readFile, writeFile, mkdir, unlink } from "node:fs/promi
 import { join, resolve, dirname, basename, relative } from "node:path"
 import { homedir } from "node:os"
 import { spawn } from "node:child_process"
-import { createInterface } from "node:readline"
+import { createInterface, emitKeypressEvents } from "node:readline"
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -106,6 +106,7 @@ async function ollamaChatRaw(
   callbacks: StreamCallbacks | undefined,
   format: unknown,
   think: boolean,
+  signal?: AbortSignal,
 ): Promise<Message> {
   const body: Record<string, unknown> = { model, messages, tools, stream: true }
   if (think) body.think = true
@@ -114,6 +115,7 @@ async function ollamaChatRaw(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   })
   if (!res.ok) {
     const text = await res.text()
@@ -189,16 +191,17 @@ export async function ollamaChat(
   tools: ToolDef[],
   callbacks?: StreamCallbacks,
   format?: unknown,
+  signal?: AbortSignal,
 ): Promise<Message> {
   const caps = await ollamaCapabilities(model)
   const think = !format && caps.includes("thinking")
   try {
-    return await ollamaChatRaw(model, messages, tools, callbacks, format, think)
+    return await ollamaChatRaw(model, messages, tools, callbacks, format, think, signal)
   } catch (e) {
     // If the model reported thinking support but rejects think:true, evict and retry once
     if (think && String(e).includes("400")) {
       modelCapabilityCache.delete(model)
-      return ollamaChatRaw(model, messages, tools, callbacks, format, false)
+      return ollamaChatRaw(model, messages, tools, callbacks, format, false, signal)
     }
     throw e
   }
@@ -1196,6 +1199,10 @@ async function main() {
   // 7. REPL loop
   const rl = createInterface({ input: process.stdin, output: process.stdout })
 
+  // Enable keypress events for Esc (interrupt) and Ctrl+Q (quit)
+  const isTTY = process.stdin.isTTY ?? false
+  if (isTTY) emitKeypressEvents(process.stdin, rl)
+
   const prompt = () =>
     new Promise<string>((res) => {
       rl.question(`${COLORS.green}> ${COLORS.reset}`, res)
@@ -1293,6 +1300,29 @@ async function main() {
     const MAX_GOAL_CHECKS = 10
     let goalChecks = 0
 
+    // Per-turn abort controller — Esc/Ctrl+C aborts and returns to prompt; Ctrl+Q exits
+    let turnAbort = new AbortController()
+    const sigintHandler = () => {
+      process.stdout.write(`\n${COLORS.yellow}⚡ Interrupted${COLORS.reset}\n`)
+      turnAbort.abort()
+    }
+    const keypressHandler = (_: unknown, key: { name?: string; ctrl?: boolean } | undefined) => {
+      if (!key) return
+      if (key.name === "escape") {
+        process.stdout.write(`\n${COLORS.yellow}⚡ Interrupted${COLORS.reset}\n`)
+        turnAbort.abort()
+      } else if (key.ctrl && key.name === "q") {
+        process.stdout.write(`\n${COLORS.dim}Bye!${COLORS.reset}\n`)
+        rl.close()
+        process.exit(0)
+      }
+    }
+    process.on("SIGINT", sigintHandler)
+    if (isTTY) {
+      process.stdin.setRawMode(true)
+      process.stdin.on("keypress", keypressHandler)
+    }
+
     supervise: while (true) {
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
         if (estimateTokens(messages) > COMPACT_THRESHOLD) {
@@ -1320,9 +1350,11 @@ async function main() {
               if (!contentStarted) contentStarted = true
               process.stdout.write(chunk)
             },
-          })
+          }, undefined, turnAbort.signal)
 
           if (thinkingStarted && !contentStarted) process.stdout.write(`${COLORS.reset}`)
+
+          if (turnAbort.signal.aborted) break
 
           messages.push(reply)
 
@@ -1343,6 +1375,8 @@ async function main() {
 
           // Execute tool calls
           for (const call of reply.tool_calls) {
+            if (turnAbort.signal.aborted) break
+
             const toolName = call.function.name
             const toolArgs = call.function.arguments
             const tool = toolMap.get(toolName)
@@ -1360,18 +1394,22 @@ async function main() {
               }
             }
 
+            if (turnAbort.signal.aborted) break
+
             // Show truncated result
             const preview = result.length > 500 ? result.slice(0, 500) + `\n${COLORS.dim}...(${result.length} chars total)${COLORS.reset}` : result
             console.log(`${COLORS.dim}${preview}${COLORS.reset}`)
 
             messages.push({ role: "tool", content: result, tool_name: toolName, tool_call_id: call.id })
           }
+          if (turnAbort.signal.aborted) break
           if (autopilotState.exited && !autopilotState.summarized) {
             autopilotState.summarized = true
             autopilot = false // exit returns to normal mode (blog: switch to build); re-arm with /autopilot
             messages.push({ role: "user", content: AUTOPILOT_SUMMARY_PROMPT })
           }
         } catch (err: unknown) {
+          if (turnAbort.signal.aborted) break
           const msg = err instanceof Error ? err.message : String(err)
           console.error(`${COLORS.red}Error: ${msg}${COLORS.reset}`)
           // Push error as assistant message so conversation doesn't break
@@ -1393,9 +1431,16 @@ async function main() {
         console.log(`⚠ supervisor check failed: ${err instanceof Error ? err.message : String(err)} — stopping`)
         break supervise
       }
+      if (turnAbort.signal.aborted) break supervise
       if (verdict.reached) { console.log(`✓ supervisor: goal reached`); break supervise }
       console.log(`↻ supervisor (${goalChecks}/${MAX_GOAL_CHECKS}): ${verdict.feedback}`)
       messages.push({ role: "user", content: `[supervisor] Goal not yet reached. ${verdict.feedback} Keep working toward the goal: ${goal}` })
+    }
+
+    process.off("SIGINT", sigintHandler)
+    if (isTTY) {
+      process.stdin.setRawMode(false)
+      process.stdin.off("keypress", keypressHandler)
     }
   }
 }
