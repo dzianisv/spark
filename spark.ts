@@ -803,6 +803,112 @@ function makeRunTests(): Tool {
   }
 }
 
+function makeListSymbols(): Tool {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "ListSymbols",
+        description: "List top-level symbols (functions, classes, constants, types) defined in a file with their line numbers. Use to understand a file's structure without reading all content.",
+        parameters: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Absolute or relative path to the file" },
+          },
+          required: ["filePath"],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(args) {
+      const filePath = resolve(String(args.filePath))
+      const content = await readFile(filePath, "utf-8").catch(() => null)
+      if (!content) return `Error: file not found: ${filePath}`
+
+      const ext = filePath.split(".").pop()?.toLowerCase() ?? ""
+      const lines = content.split("\n")
+      const symbols: string[] = []
+
+      if (["ts", "tsx", "js", "jsx"].includes(ext)) {
+        // Match: export function/class/const/type/interface/enum, and non-export top-level function/class
+        const patterns = [
+          /^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+(\w+)/,
+          /^(?:export\s+)?class\s+(\w+)/,
+          /^(?:export\s+)?(?:const|let|var)\s+(\w+)/,
+          /^(?:export\s+)?(?:type|interface|enum)\s+(\w+)/,
+        ]
+        lines.forEach((line, i) => {
+          for (const pat of patterns) {
+            const m = line.match(pat)
+            if (m) { symbols.push(`${i + 1}: ${line.trim().slice(0, 80)}`); break }
+          }
+        })
+      } else if (["py"].includes(ext)) {
+        lines.forEach((line, i) => {
+          if (/^(?:async\s+)?def\s+\w+|^class\s+\w+/.test(line)) {
+            symbols.push(`${i + 1}: ${line.trim().slice(0, 80)}`)
+          }
+        })
+      } else {
+        // Generic: any line starting with word char at col 0 that looks like a definition
+        lines.forEach((line, i) => {
+          if (/^\w[\w\s*]*\(/.test(line) && !line.startsWith(" ") && !line.startsWith("\t")) {
+            symbols.push(`${i + 1}: ${line.trim().slice(0, 80)}`)
+          }
+        })
+      }
+
+      if (symbols.length === 0) return `No top-level symbols found in ${filePath}`
+      return `# ${filePath} — ${symbols.length} symbols\n` + symbols.join("\n")
+    },
+  }
+}
+
+function makeFindSymbol(): Tool {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "FindSymbol",
+        description: "Find where a function, class, or variable is defined across the codebase. Returns file paths and line numbers. Faster than Grep for finding symbol definitions.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Symbol name to search for (exact identifier)" },
+            path: { type: "string", description: "Directory to search in (default: cwd)" },
+            include: { type: "string", description: "File pattern filter e.g. '*.ts'" },
+          },
+          required: ["name"],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(args) {
+      const name = String(args.name)
+      const dir = resolve(String(args.path ?? process.cwd()))
+      const include = args.include ? String(args.include) : undefined
+
+      // Build a pattern that matches common definition forms
+      const defPattern = `(function\\s+${name}|class\\s+${name}|const\\s+${name}\\s*=|let\\s+${name}\\s*=|var\\s+${name}\\s*=|def\\s+${name}|type\\s+${name}\\s*=|interface\\s+${name}[\\s{]|enum\\s+${name}[\\s{])`
+
+      const rgArgs = ["--line-number", "--no-heading", "--color=never", "-e", defPattern]
+      if (include) rgArgs.push("--glob", include)
+      rgArgs.push(dir)
+
+      try {
+        const proc = Bun.spawn(["rg", ...rgArgs], { stdout: "pipe", stderr: "pipe" })
+        const output = await new Response(proc.stdout).text()
+        const exitCode = await proc.exited
+        if (exitCode === 1 || !output.trim()) return `No definition found for '${name}'`
+        const lines = output.trim().split("\n").slice(0, 50)
+        return lines.join("\n")
+      } catch {
+        return "Error: ripgrep (rg) not found. Install with: brew install ripgrep"
+      }
+    },
+  }
+}
+
 function makeLoadSkill(skillMap: Map<string, string>): Tool {
   return {
     definition: {
@@ -1000,18 +1106,18 @@ async function scanSkills(): Promise<Map<string, string>> {
 async function getSkillDescriptions(skillMap: Map<string, string>): Promise<string> {
   const lines: string[] = []
   for (const [name, path] of skillMap) {
-    const content = await readFile(path, "utf-8").catch(() => "")
-    // Try to extract description from YAML frontmatter
-    const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/)
+    const fd = await readFile(path, "utf-8").catch(() => "")
+    // Only read enough to extract description — first 40 lines covers any frontmatter
+    const preview = fd.split("\n").slice(0, 40).join("\n")
+    const fmMatch = preview.match(/^---\s*\n([\s\S]*?)\n---/)
     let desc = ""
     if (fmMatch) {
       const descMatch = fmMatch[1].match(/description:\s*(.+)/)
       if (descMatch) desc = descMatch[1].trim()
     }
     if (!desc) {
-      // Fallback: first non-heading, non-empty line
-      const bodyLines = content.split("\n").filter((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"))
-      desc = bodyLines[0]?.trim().slice(0, 100) ?? ""
+      const bodyLines = preview.split("\n").filter((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"))
+      desc = bodyLines[0]?.trim().slice(0, 120) ?? ""
     }
     lines.push(`- ${name}: ${desc}`)
   }
@@ -1365,7 +1471,9 @@ async function main() {
   const grepTool = makeGrep()
   const loadSkillTool = makeLoadSkill(skillMap)
   const runTestsTool = makeRunTests()
-  const coreTools = [readFileTool, writeFileTool, bashTool, evalTool, globTool, grepTool, runTestsTool, loadSkillTool]
+  const listSymbolsTool = makeListSymbols()
+  const findSymbolTool = makeFindSymbol()
+  const coreTools = [readFileTool, writeFileTool, bashTool, evalTool, globTool, grepTool, runTestsTool, listSymbolsTool, findSymbolTool, loadSkillTool]
 
   // 4. Build system prompt
   const systemPrompt = buildSystemPrompt(agentInstructions, skillList, currentModel, gitContext)
