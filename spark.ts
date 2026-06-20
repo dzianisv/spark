@@ -68,11 +68,10 @@ interface Tool {
 // ── Ollama Client ────────────────────────────────────────────────────────────
 
 const getOllamaUrl = () => process.env.OLLAMA_URL ?? "http://localhost:11434"
-const modelCapabilityCache = new Map<string, string[]>()
+// Cache stores a Promise so concurrent cold calls for the same model share one /api/show request
+const modelCapabilityCache = new Map<string, Promise<string[]>>()
 
-async function ollamaCapabilities(model: string): Promise<string[]> {
-  const cached = modelCapabilityCache.get(model)
-  if (cached) return cached
+async function fetchCapabilities(model: string): Promise<string[]> {
   try {
     const res = await fetch(`${getOllamaUrl()}/api/show`, {
       method: "POST",
@@ -81,10 +80,18 @@ async function ollamaCapabilities(model: string): Promise<string[]> {
     })
     if (!res.ok) return []
     const data = (await res.json()) as { capabilities?: string[] }
-    const caps = data.capabilities ?? []
-    modelCapabilityCache.set(model, caps)
-    return caps
+    return data.capabilities ?? []
   } catch { return [] }
+}
+
+function ollamaCapabilities(model: string): Promise<string[]> {
+  let p = modelCapabilityCache.get(model)
+  if (!p) {
+    p = fetchCapabilities(model)
+    // only cache non-empty results — missing capabilities field means unknown, not unsupported
+    p = p.then(caps => { if (caps.length > 0) modelCapabilityCache.set(model, Promise.resolve(caps)); return caps })
+  }
+  return p
 }
 
 interface StreamCallbacks {
@@ -185,7 +192,16 @@ export async function ollamaChat(
 ): Promise<Message> {
   const caps = await ollamaCapabilities(model)
   const think = !format && caps.includes("thinking")
-  return ollamaChatRaw(model, messages, tools, callbacks, format, think)
+  try {
+    return await ollamaChatRaw(model, messages, tools, callbacks, format, think)
+  } catch (e) {
+    // If the model reported thinking support but rejects think:true, evict and retry once
+    if (think && String(e).includes("400")) {
+      modelCapabilityCache.delete(model)
+      return ollamaChatRaw(model, messages, tools, callbacks, format, false)
+    }
+    throw e
+  }
 }
 
 async function ollamaModels(): Promise<string[]> {
