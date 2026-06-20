@@ -74,21 +74,25 @@ interface StreamCallbacks {
   onContent?: (chunk: string) => void
 }
 
-export async function ollamaChat(
+async function ollamaChatRaw(
   model: string,
   messages: Message[],
   tools: ToolDef[],
-  callbacks?: StreamCallbacks,
-  format?: unknown,
+  callbacks: StreamCallbacks | undefined,
+  format: unknown,
+  think: boolean,
 ): Promise<Message> {
-  const body: Record<string, unknown> = { model, messages, tools, stream: true, think: format ? false : !thinkingUnsupported(model) }
+  const body: Record<string, unknown> = { model, messages, tools, stream: true, think }
   if (format) { body.format = format; body.options = { temperature: 0 } }
   const res = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`Ollama error ${res.status}: ${await res.text()}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw Object.assign(new Error(`Ollama error ${res.status}: ${text}`), { ollamaBody: text })
+  }
 
   const reader = res.body?.getReader()
   if (!reader) throw new Error("No response body")
@@ -153,6 +157,25 @@ export async function ollamaChat(
   return result
 }
 
+export async function ollamaChat(
+  model: string,
+  messages: Message[],
+  tools: ToolDef[],
+  callbacks?: StreamCallbacks,
+  format?: unknown,
+): Promise<Message> {
+  const think = !format
+  try {
+    return await ollamaChatRaw(model, messages, tools, callbacks, format, think)
+  } catch (e: unknown) {
+    const body = (e as { ollamaBody?: string }).ollamaBody ?? ""
+    if (think && (body.includes("think") || body.includes("does not support"))) {
+      return ollamaChatRaw(model, messages, tools, callbacks, format, false)
+    }
+    throw e
+  }
+}
+
 async function ollamaModels(): Promise<string[]> {
   const res = await fetch(`${OLLAMA_URL}/api/tags`)
   if (!res.ok) return []
@@ -178,12 +201,6 @@ function modelScore(name: string): number {
     return 10
   // everything else — middle tier
   return 200
-}
-
-// Models known to NOT support the `think` parameter — default is to send think:true (Ollama ignores it safely for non-thinking models)
-function thinkingUnsupported(model: string): boolean {
-  const n = model.toLowerCase()
-  return n.includes("qwen3-coder") || n.includes("qwen3:coder")
 }
 
 // Extract param size from model name (e.g. "qwen3:14b" → 14, "qwen3:0.6b" → 0.6)
