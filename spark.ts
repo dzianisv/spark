@@ -68,6 +68,7 @@ interface Tool {
 // ── Ollama Client ────────────────────────────────────────────────────────────
 
 const getOllamaUrl = () => process.env.OLLAMA_URL ?? "http://localhost:11434"
+const noThinkModels = new Set<string>()
 
 interface StreamCallbacks {
   onThinking?: (chunk: string) => void
@@ -164,14 +165,15 @@ export async function ollamaChat(
   callbacks?: StreamCallbacks,
   format?: unknown,
 ): Promise<Message> {
-  const think = !format
+  const think = !format && !noThinkModels.has(model)
   try {
     return await ollamaChatRaw(model, messages, tools, callbacks, format, think)
   } catch (e: unknown) {
     const err = e as { ollamaBody?: string; ollamaStatus?: number }
     const body = err.ollamaBody ?? ""
     const status = err.ollamaStatus
-    if (think && status === 400 && (body.includes("think") || body.includes("does not support"))) {
+    if (think && status === 400 && body.includes("think")) {
+      noThinkModels.add(model)
       return ollamaChatRaw(model, messages, tools, callbacks, format, false)
     }
     throw e
