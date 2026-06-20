@@ -7,6 +7,7 @@ import { join, resolve, dirname, basename, relative } from "node:path"
 import { homedir } from "node:os"
 import { spawn } from "node:child_process"
 import { createInterface, emitKeypressEvents } from "node:readline"
+import { Transform } from "node:stream"
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -1138,6 +1139,44 @@ export async function checkGoal(model: string, goal: string, messages: Message[]
   return parseVerdict(reply.content ?? "")
 }
 
+// Bracketed paste filter: sits between process.stdin and readline.
+// Intercepts ESC[200~...ESC[201~ paste sequences, encodes internal newlines
+// as NUL (\x00) so readline sees one "line" per paste, then promptMultiline
+// decodes NUL back to \n. Normal keystrokes pass through unchanged.
+function makePasteFilter(): Transform {
+  const BP_START = "\x1b[200~"
+  const BP_END   = "\x1b[201~"
+  let pasteBuf = ""
+  let pasting  = false
+
+  return new Transform({
+    decodeStrings: false,
+    transform(chunk: Buffer | string, _enc: string, cb: (err: null, data?: string) => void) {
+      let s = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk
+      let out = ""
+      while (s.length > 0) {
+        if (pasting) {
+          const end = s.indexOf(BP_END)
+          if (end === -1) { pasteBuf += s; s = "" }
+          else {
+            pasteBuf += s.slice(0, end)
+            out += pasteBuf.replace(/\n/g, "\x00") + "\n"
+            pasteBuf = ""; pasting = false
+            // consume one trailing \n (Enter pressed after paste) to avoid empty submission
+            const after = s.slice(end + BP_END.length)
+            s = after.startsWith("\n") ? after.slice(1) : after
+          }
+        } else {
+          const start = s.indexOf(BP_START)
+          if (start === -1) { out += s; s = "" }
+          else { out += s.slice(0, start); pasting = true; pasteBuf = ""; s = s.slice(start + BP_START.length) }
+        }
+      }
+      cb(null, out || undefined)
+    },
+  })
+}
+
 async function main() {
   // Docker sandbox: re-spawn inside Alpine container then exit
   if (process.argv.includes("--sandbox")) {
@@ -1201,26 +1240,36 @@ async function main() {
   printHeader(currentModel, skillMap.size)
 
   // 7. REPL loop
-  const rl = createInterface({ input: process.stdin, output: process.stdout })
-
-  // Enable keypress events for Esc (interrupt) and Ctrl+Q (quit)
   const isTTY = process.stdin.isTTY ?? false
-  if (isTTY) emitKeypressEvents(process.stdin, rl)
+
+  // Pipe stdin through the paste filter so multi-line pastes arrive as one submission.
+  const pasteFilter = makePasteFilter()
+  process.stdin.pipe(pasteFilter)
+  if (isTTY) {
+    process.stdout.write("\x1b[?2004h") // request bracketed paste from terminal
+    process.on("exit", () => process.stdout.write("\x1b[?2004l"))
+  }
+
+  const rl = createInterface({ input: pasteFilter, output: process.stdout })
+  if (isTTY) emitKeypressEvents(pasteFilter, rl)
 
   const prompt = () =>
     new Promise<string>((res) => {
       rl.question(`${COLORS.green}> ${COLORS.reset}`, res)
     })
 
-  // Collect lines: bare Enter submits; trailing \ continues to next line.
-  // Slash commands are always single-line — never continued.
+  // Collect input: bare Enter submits; trailing \ continues; bracketed pastes
+  // arrive as a single line with NUL-encoded newlines (decoded here to \n).
+  // Slash commands and paste blocks are never continued.
   const promptMultiline = async (): Promise<string> => {
     const lines: string[] = []
     while (true) {
-      const line = await prompt()
+      const raw  = await prompt()
+      const line = raw.replace(/\x00/g, "\n") // decode paste newlines
+      const isPaste   = raw.includes("\x00")
       const isCommand = lines.length === 0 && line.trimStart().startsWith("/")
-      if (!isCommand && line.endsWith("\\")) {
-        lines.push(line.slice(0, -1))
+      if (!isPaste && !isCommand && raw.endsWith("\\")) {
+        lines.push(raw.slice(0, -1))
         process.stdout.write(`${COLORS.green}... ${COLORS.reset}`)
       } else {
         lines.push(line)
@@ -1378,7 +1427,7 @@ async function main() {
     process.on("SIGINT", sigintHandler)
     if (isTTY) {
       process.stdin.setRawMode(true)
-      process.stdin.on("keypress", keypressHandler)
+      pasteFilter.on("keypress", keypressHandler)
     }
 
     supervise: while (true) {
@@ -1498,7 +1547,7 @@ async function main() {
     process.off("SIGINT", sigintHandler)
     if (isTTY) {
       try { process.stdin.setRawMode(false) } catch {}
-      process.stdin.off("keypress", keypressHandler)
+      pasteFilter.off("keypress", keypressHandler)
     }
   }
 }
