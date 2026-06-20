@@ -81,7 +81,7 @@ export async function ollamaChat(
   callbacks?: StreamCallbacks,
   format?: unknown,
 ): Promise<Message> {
-  const body: Record<string, unknown> = { model, messages, tools, stream: true, think: format ? false : supportsThinking(model) }
+  const body: Record<string, unknown> = { model, messages, tools, stream: true, think: format ? false : !thinkingUnsupported(model) }
   if (format) { body.format = format; body.options = { temperature: 0 } }
   const res = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: "POST",
@@ -180,14 +180,10 @@ function modelScore(name: string): number {
   return 200
 }
 
-// Models known to support the `think` parameter
-function supportsThinking(model: string): boolean {
+// Models known to NOT support the `think` parameter — default is to send think:true (Ollama ignores it safely for non-thinking models)
+function thinkingUnsupported(model: string): boolean {
   const n = model.toLowerCase()
-  // qwen3-coder does NOT support thinking; qwen3 base does
-  if (n.includes("qwen3-coder") || n.includes("qwen3:coder")) return false
-  if (n.includes("qwen3")) return true
-  if (n.includes("deepseek-r1") || n.includes("deepseek-r2")) return true
-  return false
+  return n.includes("qwen3-coder") || n.includes("qwen3:coder")
 }
 
 // Extract param size from model name (e.g. "qwen3:14b" → 14, "qwen3:0.6b" → 0.6)
