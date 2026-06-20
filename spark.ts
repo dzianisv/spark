@@ -132,6 +132,7 @@ async function ollamaChatRaw(
   let buf = ""
 
   while (true) {
+    if (signal?.aborted) break
     const { done, value } = await reader.read()
     if (done) break
 
@@ -288,7 +289,7 @@ const SUMMARY_SYSTEM =
 const SUMMARY_INSTRUCTION =
   "Summarize the conversation above into EXACTLY this markdown template. Keep every section header even if its content is empty. Use terse bullets.\n\n## Goal\n## Constraints & Preferences\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key Decisions\n## Next Steps\n## Critical Context\n## Relevant Files"
 
-export async function compactMessages(model: string, messages: Message[]): Promise<boolean> {
+export async function compactMessages(model: string, messages: Message[], signal?: AbortSignal): Promise<boolean> {
   const body = messages.slice(1)
   const turns = splitTurns(body)
   if (turns.length <= TAIL_TURNS) return false
@@ -324,6 +325,9 @@ export async function compactMessages(model: string, messages: Message[]): Promi
       { role: "user", content: transcript + "\n\n" + SUMMARY_INSTRUCTION },
     ],
     [],
+    undefined,
+    undefined,
+    signal,
   )
   const summary = reply.content
 
@@ -1119,7 +1123,7 @@ export function parseVerdict(text: string): GoalVerdict {
   }
 }
 
-export async function checkGoal(model: string, goal: string, messages: Message[]): Promise<GoalVerdict> {
+export async function checkGoal(model: string, goal: string, messages: Message[], signal?: AbortSignal): Promise<GoalVerdict> {
   const lastAssistant = [...messages].reverse().find(m => m.role === "assistant")?.content ?? ""
   const tail = messages.slice(-6).map(m => {
     const c = typeof m.content === "string" ? m.content.slice(0, 300) : ""
@@ -1130,7 +1134,7 @@ export async function checkGoal(model: string, goal: string, messages: Message[]
   const reply = await ollamaChat(model, [
     { role: "system", content: judgeSystem },
     { role: "user", content: judgeUser },
-  ], [], undefined, VERDICT_SCHEMA)
+  ], [], undefined, VERDICT_SCHEMA, signal)
   return parseVerdict(reply.content ?? "")
 }
 
@@ -1327,7 +1331,7 @@ async function main() {
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
         if (estimateTokens(messages) > COMPACT_THRESHOLD) {
           const before = estimateTokens(messages)
-          if (await compactMessages(currentModel, messages))
+          if (await compactMessages(currentModel, messages, turnAbort.signal))
             console.log(`↯ auto-compacted: ${before} → ${estimateTokens(messages)} est. tokens`)
         }
 
@@ -1426,7 +1430,7 @@ async function main() {
       goalChecks++
       let verdict: GoalVerdict
       try {
-        verdict = await checkGoal(currentModel, goal, messages)
+        verdict = await checkGoal(currentModel, goal, messages, turnAbort.signal)
       } catch (err: unknown) {
         console.log(`⚠ supervisor check failed: ${err instanceof Error ? err.message : String(err)} — stopping`)
         break supervise
@@ -1439,7 +1443,7 @@ async function main() {
 
     process.off("SIGINT", sigintHandler)
     if (isTTY) {
-      process.stdin.setRawMode(false)
+      try { process.stdin.setRawMode(false) } catch {}
       process.stdin.off("keypress", keypressHandler)
     }
   }

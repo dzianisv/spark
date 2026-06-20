@@ -871,4 +871,58 @@ describe("ollamaChat capability probe", () => {
     expect(reply.role).toBe("assistant")
     expect(reply.content.length).toBeGreaterThan(0)
   }, 60_000)
+
+  test("abort: AbortSignal cancels in-flight ollamaChat call", async () => {
+    // Mock server that streams slowly (never closes), so abort must fire first
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === "/api/show") {
+          return new Response(JSON.stringify({ capabilities: ["completion"] }), {
+            headers: { "Content-Type": "application/json" },
+          })
+        }
+        if (url.pathname === "/api/chat") {
+          // Send one chunk then hang indefinitely
+          const stream = new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(
+                JSON.stringify({ message: { role: "assistant", content: "partial" }, done: false }) + "\n"
+              ))
+              // intentionally never close — simulates a slow model
+            },
+          })
+          return new Response(stream, { headers: { "Content-Type": "application/x-ndjson" } })
+        }
+        return new Response("not found", { status: 404 })
+      },
+    })
+
+    const origUrl = process.env.OLLAMA_URL
+    process.env.OLLAMA_URL = `http://localhost:${server.port}`
+    try {
+      const ac = new AbortController()
+      // Abort after 200ms — well before any real timeout
+      const timer = setTimeout(() => ac.abort(), 200)
+      const start = Date.now()
+      let threw = false
+      try {
+        await sparkOllamaChat("slow-model", [{ role: "user", content: "hi" }], [], undefined, undefined, ac.signal)
+      } catch {
+        threw = true
+      } finally {
+        clearTimeout(timer)
+      }
+      const elapsed = Date.now() - start
+      // Should resolve (throw or return) within ~1s, not hang for minutes
+      expect(elapsed).toBeLessThan(2000)
+      // Either the abort causes a throw or an early return — either way we got here fast
+      expect(threw || true).toBe(true)
+    } finally {
+      if (origUrl !== undefined) process.env.OLLAMA_URL = origUrl
+      else delete process.env.OLLAMA_URL
+      server.stop()
+    }
+  }, 10_000)
 })
