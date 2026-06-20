@@ -2,7 +2,7 @@
 // spark.ts — single-file AI coding agent using Ollama
 // Zero external dependencies. Run: bun spark.ts
 
-import { readdir, stat, readFile, writeFile, mkdir } from "node:fs/promises"
+import { readdir, stat, readFile, writeFile, mkdir, unlink } from "node:fs/promises"
 import { join, resolve, dirname, basename, relative } from "node:path"
 import { homedir } from "node:os"
 import { spawn } from "node:child_process"
@@ -33,7 +33,7 @@ import { createInterface } from "node:readline"
 //
 // Strategy: we send BOTH tool_name (for Ollama native) and tool_call_id (for OpenAI compat).
 // Extra fields are ignored by each provider, so this is safe for both endpoints.
-interface Message {
+export interface Message {
   role: "system" | "user" | "assistant" | "tool"
   content: string
   tool_calls?: ToolCall[]
@@ -74,7 +74,7 @@ interface StreamCallbacks {
   onContent?: (chunk: string) => void
 }
 
-async function ollamaChat(
+export async function ollamaChat(
   model: string,
   messages: Message[],
   tools: ToolDef[],
@@ -743,7 +743,7 @@ const COLORS = {
 function printHeader(model: string, skillCount: number) {
   console.log(`${COLORS.cyan}${COLORS.bold}spark${COLORS.reset} ${COLORS.dim}— AI coding agent${COLORS.reset}`)
   console.log(`${COLORS.dim}Model:${COLORS.reset} ${model}  ${COLORS.dim}Skills:${COLORS.reset} ${skillCount}  ${COLORS.dim}Dir:${COLORS.reset} ${process.cwd()}`)
-  console.log(`${COLORS.dim}Commands: /models /clear /quit${COLORS.reset}`)
+  console.log(`${COLORS.dim}Commands: /models /clear /goal /quit${COLORS.reset}`)
   console.log()
 }
 
@@ -762,6 +762,29 @@ async function loadSavedModel(): Promise<string | null> {
   } catch {
     return null
   }
+}
+
+const GOAL_FILE = join(".agents", "spark", "goal")
+
+async function saveGoal(goal: string): Promise<void> {
+  const dir = dirname(GOAL_FILE)
+  await mkdir(dir, { recursive: true }).catch(() => {})
+  await writeFile(GOAL_FILE, goal, "utf-8")
+}
+
+async function loadGoal(): Promise<string | null> {
+  try {
+    const saved = (await readFile(GOAL_FILE, "utf-8")).trim()
+    return saved || null
+  } catch {
+    return null
+  }
+}
+
+async function clearGoal(): Promise<void> {
+  try {
+    await unlink(GOAL_FILE)
+  } catch {}
 }
 
 async function selectModel(models: string[], current: string, rl: ReturnType<typeof createInterface>): Promise<string> {
@@ -784,6 +807,39 @@ async function selectModel(models: string[], current: string, rl: ReturnType<typ
   }
   console.log(`${COLORS.dim}Keeping ${current}${COLORS.reset}`)
   return current
+}
+
+// ── Goal Supervisor ──────────────────────────────────────────────────────────
+
+export interface GoalVerdict { reached: boolean; feedback: string }
+
+export function parseVerdict(text: string): GoalVerdict {
+  const jsonMatch = text.match(/\{[\s\S]*\}/)
+  if (!jsonMatch) return { reached: false, feedback: "" }
+  try {
+    const parsed = JSON.parse(jsonMatch[0])
+    return {
+      reached: Boolean(parsed.reached),
+      feedback: String(parsed.feedback ?? ""),
+    }
+  } catch {
+    return { reached: false, feedback: "" }
+  }
+}
+
+export async function checkGoal(model: string, goal: string, messages: Message[]): Promise<GoalVerdict> {
+  const lastAssistant = [...messages].reverse().find(m => m.role === "assistant")?.content ?? ""
+  const tail = messages.slice(-6).map(m => {
+    const c = typeof m.content === "string" ? m.content.slice(0, 300) : ""
+    return `${m.role}: ${c}`
+  }).join("\n")
+  const judgeSystem = "You are a strict goal supervisor for a coding agent. You judge whether a GOAL is fully accomplished based on the conversation. Be skeptical of unverified claims."
+  const judgeUser = `GOAL: ${goal}\n\nThe agent's final message:\n${lastAssistant}\n\nRecent transcript:\n${tail}\n\nIs the GOAL fully reached? Respond with ONLY a JSON object: {"reached": true|false, "feedback": "<if not reached, one concrete next action to push the agent forward; empty string if reached>"}`
+  const reply = await ollamaChat(model, [
+    { role: "system", content: judgeSystem },
+    { role: "user", content: judgeUser },
+  ], [], undefined)
+  return parseVerdict(reply.content ?? "")
 }
 
 async function main() {
@@ -837,6 +893,10 @@ async function main() {
 
   // 6. Init conversation
   const messages: Message[] = [{ role: "system", content: systemPrompt }]
+  let goal: string | null = await loadGoal()
+  if (goal) {
+    messages[0].content += `\n\nCurrent goal: ${goal}`
+  }
 
   printHeader(currentModel, skillMap.size)
 
@@ -872,6 +932,26 @@ async function main() {
       continue
     }
 
+    if (trimmed === "/goal") {
+      console.log(goal ? `goal: ${goal}` : `(no goal set)`)
+      continue
+    }
+
+    if (trimmed.startsWith("/goal ")) {
+      const arg = trimmed.slice("/goal ".length).trim()
+      if (arg === "clear") {
+        goal = null
+        await clearGoal()
+        console.log(`goal cleared`)
+      } else {
+        goal = arg
+        await saveGoal(arg)
+        console.log(`goal set: ${arg}`)
+        messages.push({ role: "user", content: `My current goal: ${arg}` })
+      }
+      continue
+    }
+
     // Add user message
     messages.push({ role: "user", content: trimmed })
 
@@ -880,74 +960,89 @@ async function main() {
     const toolDefsForCall = tools.map((t) => t.definition)
     const toolMap = new Map(tools.map((t) => [t.definition.function.name, t]))
     const MAX_TOOL_ROUNDS = 30
+    const MAX_GOAL_CHECKS = 10
+    let goalChecks = 0
 
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-      try {
-        let thinkingStarted = false
-        let contentStarted = false
+    supervise: while (true) {
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        try {
+          let thinkingStarted = false
+          let contentStarted = false
 
-        const reply = await ollamaChat(currentModel, messages, toolDefsForCall, {
-          onThinking(chunk) {
-            if (!thinkingStarted) {
-              process.stdout.write(`${COLORS.dim}`)
-              thinkingStarted = true
-            }
-            process.stdout.write(chunk)
-          },
-          onContent(chunk) {
-            if (thinkingStarted && !contentStarted) {
-              process.stdout.write(`${COLORS.reset}\n\n`)
-            }
-            if (!contentStarted) contentStarted = true
-            process.stdout.write(chunk)
-          },
-        })
+          const reply = await ollamaChat(currentModel, messages, toolDefsForCall, {
+            onThinking(chunk) {
+              if (!thinkingStarted) {
+                process.stdout.write(`${COLORS.dim}`)
+                thinkingStarted = true
+              }
+              process.stdout.write(chunk)
+            },
+            onContent(chunk) {
+              if (thinkingStarted && !contentStarted) {
+                process.stdout.write(`${COLORS.reset}\n\n`)
+              }
+              if (!contentStarted) contentStarted = true
+              process.stdout.write(chunk)
+            },
+          })
 
-        if (thinkingStarted && !contentStarted) process.stdout.write(`${COLORS.reset}`)
+          if (thinkingStarted && !contentStarted) process.stdout.write(`${COLORS.reset}`)
 
-        messages.push(reply)
+          messages.push(reply)
 
-        // No tool calls → finalize streamed response
-        if (!reply.tool_calls?.length) {
-          if (contentStarted || thinkingStarted) process.stdout.write("\n\n")
-          break
-        }
-
-        // If there were tool calls, close any open styling
-        if (thinkingStarted || contentStarted) process.stdout.write(`${COLORS.reset}\n`)
-
-        // Execute tool calls
-        for (const call of reply.tool_calls) {
-          const toolName = call.function.name
-          const toolArgs = call.function.arguments
-          const tool = toolMap.get(toolName)
-
-          console.log(`${COLORS.magenta}[${toolName}]${COLORS.reset} ${COLORS.dim}${formatToolArgs(toolArgs)}${COLORS.reset}`)
-
-          let result: string
-          if (!tool) {
-            result = `Error: unknown tool '${toolName}'`
-          } else {
-            try {
-              result = await tool.execute(toolArgs)
-            } catch (err: unknown) {
-              result = `Error: ${err instanceof Error ? err.message : String(err)}`
-            }
+          // No tool calls → finalize streamed response
+          if (!reply.tool_calls?.length) {
+            if (contentStarted || thinkingStarted) process.stdout.write("\n\n")
+            break
           }
 
-          // Show truncated result
-          const preview = result.length > 500 ? result.slice(0, 500) + `\n${COLORS.dim}...(${result.length} chars total)${COLORS.reset}` : result
-          console.log(`${COLORS.dim}${preview}${COLORS.reset}`)
+          // If there were tool calls, close any open styling
+          if (thinkingStarted || contentStarted) process.stdout.write(`${COLORS.reset}\n`)
 
-          messages.push({ role: "tool", content: result, tool_name: toolName, tool_call_id: call.id })
+          // Execute tool calls
+          for (const call of reply.tool_calls) {
+            const toolName = call.function.name
+            const toolArgs = call.function.arguments
+            const tool = toolMap.get(toolName)
+
+            console.log(`${COLORS.magenta}[${toolName}]${COLORS.reset} ${COLORS.dim}${formatToolArgs(toolArgs)}${COLORS.reset}`)
+
+            let result: string
+            if (!tool) {
+              result = `Error: unknown tool '${toolName}'`
+            } else {
+              try {
+                result = await tool.execute(toolArgs)
+              } catch (err: unknown) {
+                result = `Error: ${err instanceof Error ? err.message : String(err)}`
+              }
+            }
+
+            // Show truncated result
+            const preview = result.length > 500 ? result.slice(0, 500) + `\n${COLORS.dim}...(${result.length} chars total)${COLORS.reset}` : result
+            console.log(`${COLORS.dim}${preview}${COLORS.reset}`)
+
+            messages.push({ role: "tool", content: result, tool_name: toolName, tool_call_id: call.id })
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err)
+          console.error(`${COLORS.red}Error: ${msg}${COLORS.reset}`)
+          // Push error as assistant message so conversation doesn't break
+          messages.push({ role: "assistant", content: `I encountered an error: ${msg}` })
+          break
         }
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err)
-        console.error(`${COLORS.red}Error: ${msg}${COLORS.reset}`)
-        // Push error as assistant message so conversation doesn't break
-        messages.push({ role: "assistant", content: `I encountered an error: ${msg}` })
-        break
       }
+
+      if (!goal) break supervise
+      if (goalChecks >= MAX_GOAL_CHECKS) {
+        console.log(`⚠ supervisor: goal not reached after ${MAX_GOAL_CHECKS} checks — stopping`)
+        break supervise
+      }
+      goalChecks++
+      const verdict = await checkGoal(currentModel, goal, messages)
+      if (verdict.reached) { console.log(`✓ supervisor: goal reached`); break supervise }
+      console.log(`↻ supervisor (${goalChecks}/${MAX_GOAL_CHECKS}): ${verdict.feedback}`)
+      messages.push({ role: "user", content: `[supervisor] Goal not yet reached. ${verdict.feedback} Keep working toward the goal: ${goal}` })
     }
   }
 }
@@ -963,7 +1058,9 @@ function formatToolArgs(args: Record<string, unknown>): string {
 
 // ── Entry ────────────────────────────────────────────────────────────────────
 
-main().catch((err) => {
-  console.error(`${COLORS.red}Fatal: ${err.message}${COLORS.reset}`)
-  process.exit(1)
-})
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(`${COLORS.red}Fatal: ${err.message}${COLORS.reset}`)
+    process.exit(1)
+  })
+}

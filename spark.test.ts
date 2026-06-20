@@ -3,6 +3,8 @@
 // Requires: Ollama running with at least one model
 
 import { test, expect, beforeAll, describe } from "bun:test"
+import { parseVerdict, checkGoal } from "./spark.ts"
+import type { Message as SparkMessage } from "./spark.ts"
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -559,3 +561,66 @@ describe("spark agent G-Eval", () => {
 // ── Summary Reporter ─────────────────────────────────────────────────────────
 
 // Bun test runner handles reporting, but we add a final summary via afterAll if needed
+
+// ── Goal Supervisor Tests ────────────────────────────────────────────────────
+
+describe("goal supervisor", () => {
+  // ── Deterministic parseVerdict tests (no LLM) ──────────────────────────────
+
+  test("parseVerdict — clean JSON reached=true", () => {
+    const result = parseVerdict('{"reached":true,"feedback":""}')
+    expect(result.reached).toBe(true)
+    expect(result.feedback).toBe("")
+  })
+
+  test("parseVerdict — clean JSON reached=false with feedback", () => {
+    const result = parseVerdict('{"reached":false,"feedback":"Run the tests first"}')
+    expect(result.reached).toBe(false)
+    expect(result.feedback).toBe("Run the tests first")
+  })
+
+  test("parseVerdict — JSON wrapped in markdown fences", () => {
+    const result = parseVerdict('```json\n{"reached":true,"feedback":""}\n```')
+    expect(result.reached).toBe(true)
+  })
+
+  test("parseVerdict — JSON embedded in prose", () => {
+    const result = parseVerdict('Based on my analysis, here is my verdict: {"reached":false,"feedback":"Need to commit changes"} I hope that helps.')
+    expect(result.reached).toBe(false)
+    expect(result.feedback).toBe("Need to commit changes")
+  })
+
+  test("parseVerdict — garbage/non-JSON input returns fail-safe", () => {
+    const result = parseVerdict("The goal is not reached yet. Please keep working.")
+    expect(result.reached).toBe(false)
+    expect(result.feedback).toBe("")
+  })
+
+  test("parseVerdict — empty string returns fail-safe", () => {
+    const result = parseVerdict("")
+    expect(result.reached).toBe(false)
+    expect(result.feedback).toBe("")
+  })
+
+  // ── LLM integration tests (need Ollama) ────────────────────────────────────
+
+  test("checkGoal — goal clearly accomplished", async () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark, a coding agent." },
+      { role: "user", content: "Create a file hello.ts that prints hello world" },
+      { role: "assistant", content: "I have created the file hello.ts with a console.log statement and verified it runs correctly. The tests all pass." },
+    ]
+    const verdict = await checkGoal(judgeModel, "Create a file hello.ts that prints hello world", messages)
+    expect(verdict.reached).toBe(true)
+  }, TIMEOUT)
+
+  test("checkGoal — goal clearly not accomplished", async () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark, a coding agent." },
+      { role: "user", content: "Make all tests pass" },
+      { role: "assistant", content: "I ran the tests and they are still failing. There are 5 errors remaining that I have not fixed yet." },
+    ]
+    const verdict = await checkGoal(judgeModel, "Make all tests pass", messages)
+    expect(verdict.reached).toBe(false)
+  }, TIMEOUT)
+})
