@@ -182,6 +182,51 @@ const TOOL_DEFS: ToolDef[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "RunTests",
+      description: "Auto-detect and run the project's test suite. Use after patching to verify correctness.",
+      parameters: {
+        type: "object",
+        properties: {
+          filter: { type: "string", description: "Test file path or pattern (optional)" },
+          workdir: { type: "string", description: "Directory to run tests in (default: cwd)" },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "ListSymbols",
+      description: "List top-level symbols (functions, classes, constants) in a file with line numbers.",
+      parameters: {
+        type: "object",
+        properties: {
+          filePath: { type: "string", description: "Path to the file" },
+        },
+        required: ["filePath"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "FindSymbol",
+      description: "Find where a function, class, or variable is defined across the codebase.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Symbol name to search for" },
+          path: { type: "string", description: "Directory to search in (default: cwd)" },
+          include: { type: "string", description: "File pattern filter e.g. '*.ts'" },
+        },
+        required: ["name"],
+      },
+    },
+  },
 ]
 
 // ── Simulated Tool Execution ─────────────────────────────────────────────────
@@ -259,6 +304,32 @@ async function executeToolCall(name: string, args: Record<string, unknown>): Pro
       } catch (err: unknown) {
         return `Error: ${err instanceof Error ? err.message : String(err)}`
       }
+    }
+    case "RunTests":
+      return `[TESTS PASSED]\nCommand: bun test\n\nbun test v1.3.14\n 3 pass\n 0 fail\nRan 3 tests. [1234ms]`
+    case "ListSymbols": {
+      const filePath = resolve(String(args.filePath))
+      const content = await readFile(filePath, "utf-8").catch(() => null)
+      if (!content) return `Error: file not found: ${filePath}`
+      const lines = content.split("\n")
+      const symbols: string[] = []
+      const patterns = [
+        /^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+(\w+)/,
+        /^(?:export\s+)?class\s+(\w+)/,
+        /^(?:export\s+)?(?:const|let|var)\s+(\w+)/,
+        /^(?:export\s+)?(?:type|interface|enum)\s+(\w+)/,
+      ]
+      lines.forEach((line, i) => {
+        for (const pat of patterns) {
+          if (pat.test(line)) { symbols.push(`${i + 1}: ${line.trim().slice(0, 80)}`); break }
+        }
+      })
+      if (symbols.length === 0) return `No top-level symbols found in ${filePath}`
+      return `# ${filePath} — ${symbols.length} symbols\n` + symbols.slice(0, 30).join("\n")
+    }
+    case "FindSymbol": {
+      const name = String(args.name)
+      return `spark.ts:374: function make${name.charAt(0).toUpperCase() + name.slice(1)}(): Tool`
     }
     case "LoadSkill":
       return `Error: skill '${args.name}' not found. Available: (none in test env)`
@@ -537,6 +608,51 @@ describe("spark agent G-Eval", () => {
     console.log(`  Reasoning: ${score.reasoning}`)
 
     expect(score.tool_selection).toBeGreaterThanOrEqual(2)
+    expect(score.task_completion).toBeGreaterThanOrEqual(2)
+  }, TIMEOUT)
+
+  test("RunTests — verify after patch", async () => {
+    const trace = await runAgent(agentModel,
+      "I just patched auth.ts to fix the login bug. Run the tests to verify the fix.")
+
+    const score = await judge(judgeModel,
+      "User asked agent to run tests after a patch. Agent should use RunTests tool.",
+      "RunTests", trace)
+
+    console.log(`  RunTests scores: sel=${score.tool_selection} usage=${score.tool_usage} task=${score.task_completion}`)
+    console.log(`  Reasoning: ${score.reasoning}`)
+
+    expect(score.tool_selection).toBeGreaterThanOrEqual(3)
+    expect(score.task_completion).toBeGreaterThanOrEqual(2)
+  }, TIMEOUT)
+
+  test("ListSymbols — understand file structure", async () => {
+    const trace = await runAgent(agentModel,
+      "What functions are defined in spark.ts? List them with line numbers.")
+
+    const score = await judge(judgeModel,
+      "User asked to list functions in a file. Agent should use ListSymbols tool on spark.ts.",
+      "ListSymbols", trace)
+
+    console.log(`  ListSymbols scores: sel=${score.tool_selection} usage=${score.tool_usage} task=${score.task_completion}`)
+    console.log(`  Reasoning: ${score.reasoning}`)
+
+    expect(score.tool_selection).toBeGreaterThanOrEqual(3)
+    expect(score.task_completion).toBeGreaterThanOrEqual(2)
+  }, TIMEOUT)
+
+  test("FindSymbol — locate a definition", async () => {
+    const trace = await runAgent(agentModel,
+      "Where is the function 'ollamaChat' defined? Find its file and line number.")
+
+    const score = await judge(judgeModel,
+      "User asked to find where ollamaChat is defined. Agent should use FindSymbol tool.",
+      "FindSymbol", trace)
+
+    console.log(`  FindSymbol scores: sel=${score.tool_selection} usage=${score.tool_usage} task=${score.task_completion}`)
+    console.log(`  Reasoning: ${score.reasoning}`)
+
+    expect(score.tool_selection).toBeGreaterThanOrEqual(3)
     expect(score.task_completion).toBeGreaterThanOrEqual(2)
   }, TIMEOUT)
 
