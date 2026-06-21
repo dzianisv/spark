@@ -194,9 +194,12 @@ export async function ollamaChat(
   callbacks?: StreamCallbacks,
   format?: unknown,
   signal?: AbortSignal,
+  forceThink?: boolean,
 ): Promise<Message> {
   const caps = await ollamaCapabilities(model)
-  const think = !format && caps.includes("thinking")
+  const think = forceThink !== undefined
+    ? (forceThink && caps.includes("thinking"))
+    : (!format && caps.includes("thinking"))
   try {
     return await ollamaChatRaw(model, messages, tools, callbacks, format, think, signal)
   } catch (e) {
@@ -1195,6 +1198,7 @@ async function main() {
   // Try saved model first, fall back to auto-pick
   const savedModel = await loadSavedModel()
   let currentModel: string
+  let effortLevel: "low" | "medium" | "high" | "max" = "medium"
   if (savedModel && models.includes(savedModel)) {
     currentModel = savedModel
     console.log(`${COLORS.dim}Restored saved model: ${savedModel}${COLORS.reset}`)
@@ -1322,6 +1326,29 @@ async function main() {
     if (trimmed === "/models") {
       const freshModels = await ollamaModels()
       currentModel = await selectModel(freshModels, currentModel, rl)
+      continue
+    }
+
+    if (trimmed.startsWith("/model ")) {
+      const name = trimmed.slice("/model ".length).trim()
+      if (name) {
+        currentModel = name
+        console.log(`Model set to ${name}`)
+      } else {
+        console.log(`Usage: /model <name>`)
+      }
+      continue
+    }
+
+    if (trimmed.startsWith("/effort ")) {
+      const level = trimmed.slice("/effort ".length).trim()
+      if (level === "low" || level === "medium" || level === "high" || level === "max") {
+        effortLevel = level
+        const thinkEnabled = level === "high" || level === "max"
+        console.log(`Effort set to ${level} (think: ${thinkEnabled})`)
+      } else {
+        console.log(`Usage: /effort low|medium|high|max`)
+      }
       continue
     }
 
@@ -1457,7 +1484,7 @@ async function main() {
               if (!contentStarted) contentStarted = true
               process.stdout.write(chunk)
             },
-          }, undefined, turnAbort.signal)
+          }, undefined, turnAbort.signal, effortLevel === "high" || effortLevel === "max")
 
           if (thinkingStarted && !contentStarted) process.stdout.write(`${COLORS.reset}`)
 
