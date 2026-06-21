@@ -412,6 +412,8 @@ function makeReadFile(): Tool {
 
       const content = await readFile(filePath, "utf-8")
       const lines = content.split("\n")
+      const total = lines.length
+      if (offset > total) return `Error: offset ${offset} exceeds file length (${total} lines)`
       const slice = lines.slice(offset - 1, offset - 1 + limit)
       const numbered = slice.map((line, i) => {
         const num = offset + i
@@ -419,11 +421,29 @@ function makeReadFile(): Tool {
         return `${num}: ${truncated}`
       })
 
-      const total = lines.length
       const shown = slice.length
       const header = shown < total ? `(Showing lines ${offset}-${offset + shown - 1} of ${total})` : ""
       return truncateOutput(numbered.join("\n") + (header ? `\n${header}` : ""))
     },
+  }
+}
+
+async function checkedWrite(filePath: string, content: string): Promise<string | null> {
+  if (!filePath.endsWith(".ts") && !filePath.endsWith(".tsx")) return null
+  const tmpPath = join(dirname(filePath), `.spark-check-${Date.now()}.ts`)
+  try {
+    await writeFile(tmpPath, content, "utf-8")
+    const proc = Bun.spawn(["bun", "--check", tmpPath], { stdout: "pipe", stderr: "pipe" })
+    await proc.exited
+    await unlink(tmpPath).catch(() => {})
+    if (proc.exitCode !== 0) {
+      const err = await new Response(proc.stderr).text()
+      return `Syntax error: ${err.trim()}`
+    }
+    return null
+  } catch (e) {
+    await unlink(tmpPath).catch(() => {})
+    return `Syntax error: ${String(e)}`
   }
 }
 
@@ -506,6 +526,8 @@ function makeWriteFile(): Tool {
 
       // Full write mode
       const content = String(args.content ?? "")
+      const syntaxErr = await checkedWrite(filePath, content)
+      if (syntaxErr) return syntaxErr
       const existing = await readFile(filePath, "utf-8").catch(() => null)
       await writeFile(filePath, content, "utf-8")
 
@@ -830,6 +852,29 @@ export function makeAutopilotExit(state: { exited: boolean }): Tool {
     async execute(_args: Record<string, unknown>): Promise<string> {
       state.exited = true
       return "Autopilot exit acknowledged. Provide a brief final summary."
+    },
+  }
+}
+
+function makePhaseAdvance(currentPhase: { value: number }): Tool {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "PhaseAdvance",
+        description: "Advance to the next phase of the repair workflow (from locate to repair).",
+        parameters: {
+          type: "object",
+          properties: {},
+          required: [],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(_args: Record<string, unknown>): Promise<string> {
+      const newPhase = currentPhase.value + 1
+      currentPhase.value = newPhase
+      return `Phase advanced to ${newPhase}. You are now in the repair phase — proceed with WriteFile edits and RunTests verification.`
     },
   }
 }
