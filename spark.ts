@@ -1420,8 +1420,31 @@ async function main() {
       // fall through into the agent loop below by NOT continuing
     }
 
+    // Per-turn git context refresh: inject lightweight git state before each LLM call
+    let perTurnGitBlock: string | null = null
+    if (!skipGenericPush) {
+      const runGit = (cmd: string) =>
+        new Promise<string>((res) => {
+          const proc = spawn("sh", ["-c", cmd], { cwd: process.cwd(), stdio: ["ignore", "pipe", "ignore"] })
+          const chunks: Buffer[] = []
+          proc.stdout.on("data", (d: Buffer) => chunks.push(d))
+          proc.on("close", () => res(Buffer.concat(chunks).toString("utf-8").trim()))
+          proc.on("error", () => res(""))
+        })
+      const [diffStat, statusShort] = await Promise.all([
+        runGit("git diff --stat HEAD 2>/dev/null"),
+        runGit("git status --short 2>/dev/null"),
+      ])
+      if (diffStat || statusShort) {
+        perTurnGitBlock = `[Git: ${diffStat || "(no diff)"}\n${statusShort || ""}]`.trim()
+      }
+    }
+
     // Add user message
-    if (!skipGenericPush) messages.push({ role: "user", content: trimmed })
+    if (!skipGenericPush) {
+      const content = perTurnGitBlock ? `${perTurnGitBlock}\n\n${trimmed}` : trimmed
+      messages.push({ role: "user", content })
+    }
 
     // Agent loop: call model, handle tool calls, repeat until text response
     const tools = buildTools()
@@ -1456,6 +1479,9 @@ async function main() {
       process.stdin.setRawMode(true)
       pasteFilter.on("keypress", keypressHandler)
     }
+
+    // Doom loop detection: track last 3 tool calls (name + stringified args)
+    const recentToolCalls: string[] = []
 
     supervise: while (true) {
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -1535,6 +1561,15 @@ async function main() {
             console.log(`${COLORS.dim}${preview}${COLORS.reset}`)
 
             messages.push({ role: "tool", content: result, tool_name: toolName, tool_call_id: call.id })
+
+            // Doom loop detection: track identical tool+args combos
+            const callSig = toolName + JSON.stringify(toolArgs)
+            recentToolCalls.push(callSig)
+            if (recentToolCalls.length > 3) recentToolCalls.shift()
+            if (recentToolCalls.length === 3 && recentToolCalls[0] === recentToolCalls[1] && recentToolCalls[1] === recentToolCalls[2]) {
+              messages.push({ role: "user", content: `[System: You have called ${toolName} with identical arguments 3 times in a row. Change your approach — try a different tool or different arguments.]` })
+              recentToolCalls.length = 0
+            }
           }
           if (turnAbort.signal.aborted) break
           if (autopilotState.exited && !autopilotState.summarized) {
