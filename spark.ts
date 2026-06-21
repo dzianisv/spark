@@ -1198,7 +1198,7 @@ async function main() {
   // Try saved model first, fall back to auto-pick
   const savedModel = await loadSavedModel()
   let currentModel: string
-  let effortLevel: "low" | "medium" | "high" | "max" = "medium"
+  let thinkingEnabled = false
   if (savedModel && models.includes(savedModel)) {
     currentModel = savedModel
     console.log(`${COLORS.dim}Restored saved model: ${savedModel}${COLORS.reset}`)
@@ -1340,14 +1340,16 @@ async function main() {
       continue
     }
 
-    if (trimmed.startsWith("/effort ")) {
-      const level = trimmed.slice("/effort ".length).trim()
-      if (level === "low" || level === "medium" || level === "high" || level === "max") {
-        effortLevel = level
-        const thinkEnabled = level === "high" || level === "max"
-        console.log(`Effort set to ${level} (think: ${thinkEnabled})`)
+    if (trimmed.startsWith("/think")) {
+      const arg = trimmed.slice("/think".length).trim()
+      if (arg === "on" || arg === "1" || arg === "true") {
+        thinkingEnabled = true
+        console.log(`Thinking mode ON — model will use extended reasoning (slower)`)
+      } else if (arg === "off" || arg === "0" || arg === "false" || arg === "") {
+        thinkingEnabled = false
+        console.log(`Thinking mode OFF`)
       } else {
-        console.log(`Usage: /effort low|medium|high|max`)
+        console.log(`Usage: /think on|off`)
       }
       continue
     }
@@ -1510,7 +1512,7 @@ async function main() {
               if (!contentStarted) contentStarted = true
               process.stdout.write(chunk)
             },
-          }, undefined, turnAbort.signal, effortLevel === "high" || effortLevel === "max")
+          }, undefined, turnAbort.signal, thinkingEnabled)
 
           if (thinkingStarted && !contentStarted) process.stdout.write(`${COLORS.reset}`)
 
