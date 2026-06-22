@@ -756,18 +756,18 @@ describe("goal supervisor v2 — last-2-message judge", () => {
     expect(verdict.reached).toBe(false)
   }, TIMEOUT)
 
-  test("tool output included as evidence: passing test output in tool msg → reached=true", async () => {
-    // Verifies that checkGoal includes recent tool messages so the judge can see
-    // actual command output rather than trusting agent prose alone.
+  test("tool evidence in agent prose → reached=true (agent summarised tool output)", async () => {
+    // The agent is responsible for pasting evidence into its reply (buildGoalBlock enforces this).
+    // The judge evaluates the agent's final message — no need to re-parse tool msgs directly.
     const messages: SparkMessage[] = [
       { role: "system", content: "You are spark." },
       { role: "user", content: "Write and run tests for the sum function" },
       { role: "assistant", content: "", tool_calls: [{ id: "t1", function: { name: "Bash", arguments: { command: "bun test sum.test.ts" } } }] },
-      { role: "tool", content: "✓ sum(1,2) equals 3\n✓ sum(-1,1) equals 0\n✓ sum(0,0) equals 0\n3 pass  0 fail", tool_name: "Bash", tool_call_id: "t1" },
-      { role: "assistant", content: "All tests pass. Done." },
+      { role: "tool", content: "✓ sum(1,2) equals 3\n✓ sum(-1,1) equals 0\n3 pass  0 fail", tool_name: "Bash", tool_call_id: "t1" },
+      // Agent includes tool output in its final response — this is what buildGoalBlock demands
+      { role: "assistant", content: "Done. Test output:\n```\n✓ sum(1,2) equals 3\n✓ sum(-1,1) equals 0\n3 pass  0 fail\n```\nAll tests pass." },
     ]
     const verdict = await checkGoal(judgeModel, "Write and run tests for the sum function", messages)
-    // Judge should see the tool output (3 pass 0 fail) and confirm done
     expect(verdict.reached).toBe(true)
   }, TIMEOUT)
 
@@ -959,7 +959,7 @@ describe("buildGoalBlock", () => {
   test("contains evidence rule", () => {
     const block = buildGoalBlock("Write a sort function")
     expect(block).toContain("Evidence rule")
-    expect(block).toContain("bare assertion does NOT count")
+    expect(block).toContain("does NOT count as evidence")
   })
 
   test("returns empty string for empty goal", () => {

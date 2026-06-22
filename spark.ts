@@ -1184,10 +1184,10 @@ MANDATORY: The following goal MUST be demonstrably met before the task is comple
 
   "${goal.trim()}"
 
-Evidence rule: a claim that this goal is met MUST be backed by evidence already
-in the conversation — commands run and their output, tests executed, files created
-and verified. A bare assertion does NOT count as evidence. If you believe the goal
-is met, show the proof (command output, file contents, test results).`
+Evidence rule: when you believe this goal is met, you MUST include the evidence
+directly in your response — paste the relevant command output, test results, or
+file contents. A bare assertion ("I'm done", "tests pass") without showing the
+output does NOT count as evidence and will NOT be accepted as completion.`
 }
 
 /**
@@ -1275,16 +1275,13 @@ export async function checkGoal(model: string, goal: string, messages: Message[]
     typeof m.content === "string" &&
     !INJECTED_PREFIXES.some(p => (m.content as string).startsWith(p))
   )?.content ?? ""
-  // Include the last few tool results as evidence for the judge — this is what
-  // buildGoalBlock's evidence rule asks for: "commands run and their output".
-  const recentToolOutput = messages
-    .filter(m => m.role === "tool" && typeof m.content === "string")
-    .slice(-3)
-    .map(m => `[tool:${(m as {tool_name?: string}).tool_name ?? "?"}] ${String(m.content).slice(0, 400)}`)
-    .join("\n")
+  // The judge evaluates the agent's final claim — the agent is responsible for
+  // including evidence (test output, command results) in its response text.
+  // buildGoalBlock enforces this on the agent side. We don't re-parse tool msgs
+  // here because: (a) they're noisy/truncated, (b) good agents already summarise
+  // them in prose, (c) it inflates the judge prompt for small local models.
   const judgeSystem = "You are a strict goal supervisor for a coding agent. You judge whether a GOAL is fully accomplished based on the conversation. Be skeptical of unverified claims."
-  const evidenceSection = recentToolOutput ? `\nRecent tool output (evidence):\n${recentToolOutput}\n` : ""
-  const judgeUser = `GOAL: ${goal}\n\nLast user message:\n${typeof lastUser === "string" ? lastUser : ""}${evidenceSection}\nAgent's last message:\n${typeof lastAssistant === "string" ? lastAssistant : ""}\n\nIs the GOAL fully reached? Respond with ONLY a JSON object: {"reached": true|false, "feedback": "<if not reached, one concrete next action to push the agent forward; empty string if reached>"}`
+  const judgeUser = `GOAL: ${goal}\n\nLast user message:\n${typeof lastUser === "string" ? lastUser : ""}\n\nAgent's last message:\n${typeof lastAssistant === "string" ? lastAssistant : ""}\n\nIs the GOAL fully reached? Respond with ONLY a JSON object: {"reached": true|false, "feedback": "<if not reached, one concrete next action to push the agent forward; empty string if reached>"}`
   const reply = await ollamaChat(model, [
     { role: "system", content: judgeSystem },
     { role: "user", content: judgeUser },
