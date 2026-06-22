@@ -1307,15 +1307,27 @@ export function makeTaskTools(
         parameters: {
           type: "object",
           properties: {
-            task_ids: { type: "array", items: { type: "string" }, description: "Array of task_id strings returned by Task" },
+            task_ids: { type: "array", items: { type: "string" }, description: "Array of task_id strings returned by Task. Also accepts a single task_id string." },
+            task_id: { type: "string", description: "Alias: single task_id string (use task_ids array for multiple)" },
           },
-          required: ["task_ids"],
+          required: [],
           additionalProperties: false,
         },
       },
     },
     async execute(args) {
-      const ids = (args.task_ids as string[]) ?? []
+      // Defensive: accept task_id (singular string), task_ids (array), or a bare string
+      // Small models often pass task_id:"uuid" instead of task_ids:["uuid"]
+      let ids: string[]
+      if (Array.isArray(args.task_ids)) {
+        ids = args.task_ids as string[]
+      } else if (typeof args.task_ids === "string") {
+        ids = [args.task_ids]
+      } else if (typeof args.task_id === "string") {
+        ids = [args.task_id as string]
+      } else {
+        ids = []
+      }
       if (!ids.length) return "Error: task_ids must be a non-empty array"
 
       // allSettled so one failed task doesn't discard sibling results
