@@ -194,9 +194,12 @@ export async function ollamaChat(
   callbacks?: StreamCallbacks,
   format?: unknown,
   signal?: AbortSignal,
+  forceThink?: boolean,
 ): Promise<Message> {
   const caps = await ollamaCapabilities(model)
-  const think = !format && caps.includes("thinking")
+  const think = forceThink !== undefined
+    ? (forceThink && caps.includes("thinking"))
+    : (!format && caps.includes("thinking"))
   try {
     return await ollamaChatRaw(model, messages, tools, callbacks, format, think, signal)
   } catch (e) {
@@ -417,6 +420,8 @@ function makeReadFile(): Tool {
 
       const content = await readFile(filePath, "utf-8")
       const lines = content.split("\n")
+      const total = lines.length
+      if (offset > total) return `Error: offset ${offset} exceeds file length (${total} lines)`
       const slice = lines.slice(offset - 1, offset - 1 + limit)
       const numbered = slice.map((line, i) => {
         const num = offset + i
@@ -424,7 +429,6 @@ function makeReadFile(): Tool {
         return `${num}: ${truncated}`
       })
 
-      const total = lines.length
       const shown = slice.length
       const end = offset - 1 + shown
       const header = `# ${filePath} | ${total} lines total | showing ${offset}-${end}`
@@ -453,7 +457,6 @@ async function checkedWrite(filePath: string, content: string): Promise<string |
   }
   return null
 }
-
 function makeWriteFile(): Tool {
   return {
     definition: {
@@ -541,6 +544,8 @@ function makeWriteFile(): Tool {
 
       // Full write mode
       const content = String(args.content ?? "")
+      const syntaxErr = await checkedWrite(filePath, content)
+      if (syntaxErr) return syntaxErr
       const existing = await readFile(filePath, "utf-8").catch(() => null)
       const checkErr = await checkedWrite(filePath, content)
       if (checkErr) return checkErr
@@ -1076,7 +1081,8 @@ export function makePhaseAdvance(state: { phase: number }): Tool {
       type: "function",
       function: {
         name: "phase_advance",
-        description: "Advance from the current phase to the next. In phased autopilot: call this when you have fully explored the codebase and understand the changes needed. This unlocks WriteFile.",
+        description:
+          "Advance from current phase to next in phased autopilot. Call this when you have fully explored codebase and understand changes needed.",
         parameters: {
           type: "object",
           properties: {
@@ -1087,13 +1093,12 @@ export function makePhaseAdvance(state: { phase: number }): Tool {
         },
       },
     },
-    async execute(args) {
+    async execute(_args: Record<string, unknown>): Promise<string> {
       state.phase++
-      return `Phase advanced to ${state.phase}. WriteFile and RunTests are now available. Begin implementing changes.`
+      return `Phase advanced to ${state.phase}. You are now in the repair phase — proceed with WriteFile edits and RunTests verification.`
     },
   }
 }
-
 // ── Skill Scanner ────────────────────────────────────────────────────────────
 
 async function scanSkills(): Promise<Map<string, string>> {
@@ -1344,6 +1349,22 @@ async function clearGoal(): Promise<void> {
   } catch {}
 }
 
+const AUTOPILOT_COUNT_FILE = join(".agents", "spark", "autopilot-count")
+
+async function loadAutopilotCount(): Promise<number> {
+  try {
+    return parseInt(await readFile(AUTOPILOT_COUNT_FILE, "utf-8"), 10) || 0
+  } catch {
+    return 0
+  }
+}
+
+async function saveAutopilotCount(n: number): Promise<void> {
+  const dir = dirname(AUTOPILOT_COUNT_FILE)
+  await mkdir(dir, { recursive: true }).catch(() => {})
+  await writeFile(AUTOPILOT_COUNT_FILE, String(n), "utf-8")
+}
+
 async function selectModel(models: string[], current: string, rl: ReturnType<typeof createInterface>): Promise<string> {
   console.log(`\n${COLORS.cyan}Available models:${COLORS.reset}`)
   models.forEach((m, i) => {
@@ -1367,7 +1388,153 @@ async function selectModel(models: string[], current: string, rl: ReturnType<typ
 }
 
 // ── Goal Supervisor ──────────────────────────────────────────────────────────
+//
+// DESIGN CONTEXT: how GitHub Copilot and Claude Code handle goal supervision,
+// and how spark.ts adapts those ideas for a local single-file Ollama agent.
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ GitHub Copilot Cloud Agent (docs.github.com/en/copilot/how-tos/use-    │
+// │ copilot-agents/cloud-agent)                                             │
+// │                                                                         │
+// │ Copilot has no "/goal" command. The task IS the goal — it comes from    │
+// │ an issue, chat message, PR comment, CLI prompt, or API call. Copilot   │
+// │ runs autonomously in a cloud sandbox, creates a branch, makes changes, │
+// │ and opens a PR. Completion is defined by: PR created + built-in code   │
+// │ review + security scan pass. There is no interactive judge loop —      │
+// │ the agent either finishes and ships a PR, or stalls and times out.     │
+// │                                                                         │
+// │ Key features:                                                           │
+// │ - Built-in Copilot code review (second-opinion on every PR)            │
+// │ - Security validation (hardcoded secrets, insecure deps)               │
+// │ - Automations: trigger on schedule or GitHub events (issue opened etc) │
+// │ - No explicit attempt cap exposed to user; cloud infra enforces limits  │
+// └─────────────────────────────────────────────────────────────────────────┘
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ Claude Code agents-supervisor plugin (github.com/dzianisv/             │
+// │ agents-supervisor — core/goal.mjs, opencode/supervisor-impl.ts)        │
+// │                                                                         │
+// │ 3 supervisor modes:                                                     │
+// │   reflection (default) — judge fires on every Stop hook, no goal       │
+// │   goal                 — /supervisor:goal <condition> sets explicit     │
+// │                          goal; judge checks it each turn               │
+// │   autopilot            — skip judge, always continue until budget gone  │
+// │                                                                         │
+// │ Goal state (per-session JSON, mode 0600):                               │
+// │   { condition, status, attempts, tokenBaseline, startedAt, deadline }   │
+// │   DEFAULT_MAX_ATTEMPTS = 16                                             │
+// │   DEFAULT_MAX_GOAL_DURATION_MS = 30 * 60 * 1000  (30 min deadline)     │
+// │                                                                         │
+// │ Goal injection (buildGoalRequirementSection):                           │
+// │   "## GOAL (mandatory completion requirement)"                          │
+// │   + evidence rule: "bare assertion does NOT count as evidence"          │
+// │                                                                         │
+// │ 2-stage judge:                                                          │
+// │   Stage 1: agent self-assessment JSON (status/stuck/missing/evidence)  │
+// │   Stage 2: external judge prompt validates the self-assessment          │
+// │                                                                         │
+// │ Escalating feedback (buildEscalatingFeedback):                          │
+// │   - Planning loop detected (read-only tools, no writes) → hard STOP    │
+// │   - Action loop detected (same commands repeated) → change approach    │
+// │   - Normal: gentle → missing/next_actions list → stuck warning         │
+// │                                                                         │
+// │ Antipatterns mined from 227 real agent stops (78% premature):          │
+// │   PERMISSION-SEEKING, STOPPED-WITH-TODOS, VERIFICATION-DEFERRAL,       │
+// │   FALSE-COMPLETE                                                        │
+// └─────────────────────────────────────────────────────────────────────────┘
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ spark.ts — simplified adaptation for local Ollama                      │
+// │                                                                         │
+// │ 2 states instead of 3 modes:                                            │
+// │   goal string (null = off)  — set via /goal or synthesised by LLM      │
+// │   autopilot bool            — extends tool budget to 200 rounds,       │
+// │                               adds autopilot_exit tool                 │
+// │                                                                         │
+// │ Key differences from CC:                                                │
+// │ - No deadline (30-min wall would kill long Ollama tasks)               │
+// │ - No self-assessment stage (adds a full LLM round per check)           │
+// │ - No per-session JSON (single .agents/spark/goal file, plain text)     │
+// │ - deriveGoal(): LLM synthesises goal from conversation — CC requires   │
+// │   the user to write the condition manually                             │
+// │ - Bounded check cap: interactive=5, autopilot=50 (CC default: 16)      │
+// │ - "copilot: ● Started autopilot objective #N" display format           │
+// └─────────────────────────────────────────────────────────────────────────┘
 
+/**
+ * Injects the active goal into the system prompt as a MANDATORY completion
+ * requirement with an evidence rule.
+ *
+ * Design: mirrors Claude Code agents-supervisor `buildGoalRequirementSection()`
+ * (core/goal.mjs). The key insight from that implementation: the goal block
+ * must be framed as MANDATORY — not advisory — and must include an evidence
+ * rule so the agent knows it cannot just assert "done". Without this framing,
+ * small local models frequently declare completion without verification.
+ *
+ * Unlike CC, we also tell the agent WHERE to put the evidence (in its reply),
+ * because spark's judge only reads the final assistant message — not raw tool
+ * logs. The agent is responsible for surfacing proof in prose.
+ *
+ * Ref: ~/workspace/agents-supervisor/core/goal.mjs → buildGoalRequirementSection()
+ */
+export function buildGoalBlock(goal: string): string {
+  if (!goal.trim()) return ""
+  return `
+
+## GOAL (mandatory completion requirement)
+
+MANDATORY: The following goal MUST be demonstrably met before the task is complete:
+
+  "${goal.trim()}"
+
+Evidence rule: when you believe this goal is met, you MUST include the evidence
+directly in your response — paste the relevant command output, test results, or
+file contents. A bare assertion ("I'm done", "tests pass") without showing the
+output does NOT count as evidence and will NOT be accepted as completion.`
+}
+
+/**
+ * Builds an escalating supervisor feedback message based on how many judge
+ * checks have already fired for the current turn.
+ *
+ * Design: simplified port of Claude Code agents-supervisor
+ * `buildEscalatingFeedback()` (core/feedback.mjs). The CC version detects
+ * planning loops (read-only tool pattern) and action loops (repeated identical
+ * commands) and emits hard STOP messages. spark.ts uses a simpler count-based
+ * escalation without loop detection (doom-loop detection in the tool call layer
+ * already handles the action-loop case).
+ *
+ * Escalation levels:
+ *   1-2:  gentle nudge — keep working, include goal text
+ *   3-4:  firmer — "if you've been reading files, start writing"
+ *   5-9:  strong — "STOP PLANNING, pick one action and execute it"
+ *   10+:  final warning — "complete NOW or call autopilot_exit"
+ *
+ * The feedback string from checkGoal() is prepended so the agent sees
+ * BOTH the judge's specific next-step suggestion AND the escalating tone.
+ *
+ * Ref: ~/workspace/agents-supervisor/core/feedback.mjs → buildEscalatingFeedback()
+ */
+export function buildSupervisorFeedback(checkCount: number, goal: string, feedback: string): string {
+  const base = feedback ? `${feedback} ` : ""
+  if (checkCount <= 2) {
+    return `[supervisor] Goal not yet reached. ${base}Keep working toward the goal: ${goal}`
+  }
+  if (checkCount <= 4) {
+    return `[supervisor] Still not reached after ${checkCount} checks. ${base}If you have been only reading files, start writing. Make a concrete change now. Goal: ${goal}`
+  }
+  if (checkCount <= 9) {
+    return `[supervisor] STOP PLANNING — ${checkCount} checks have fired with no completion. ${base}Do NOT read more files. Pick one concrete action and execute it immediately. Goal: ${goal}`
+  }
+  return `[supervisor] WARNING: ${checkCount} supervisor cycles without completion. ${base}You must either complete the goal NOW or call autopilot_exit and explain why it cannot be done. Goal: ${goal}`
+}
+
+
+
+/** Verdict from the goal judge. Kept minimal — CC uses a richer schema with
+ *  status/stuck/missing[]/next_actions[] but that requires a larger model to
+ *  reliably produce. For small local Ollama models, a binary reached+feedback
+ *  is more reliable and fast enough for the check interval. */
 export interface GoalVerdict { reached: boolean; feedback: string }
 
 const VERDICT_SCHEMA = {
@@ -1379,23 +1546,115 @@ const VERDICT_SCHEMA = {
   required: ["reached", "feedback"],
 } as const
 
+/** Parses the judge's JSON response. Fails safe to reached=false so the agent
+ *  keeps working rather than falsely declaring done on a malformed reply. */
 export function parseVerdict(text: string): GoalVerdict {
   try {
     const parsed = JSON.parse(text)
     return { reached: Boolean(parsed.reached), feedback: String(parsed.feedback ?? "") }
   } catch {
-    return { reached: false, feedback: "" } // fail-safe: keep working rather than falsely declare done
+    return { reached: false, feedback: "" }
   }
 }
 
+/**
+ * LLM-derives or refines a goal from the conversation context.
+ *
+ * This is spark's main divergence from Claude Code: CC requires the user to
+ * write the goal condition manually (/supervisor:goal <condition>). spark
+ * synthesises it automatically from recent conversation turns, making the
+ * system work without the user knowing the exact goal syntax.
+ *
+ * If existingGoal is set (via /goal or a prior /autopilot run), the model
+ * refines it to be more specific and verifiable. Otherwise it derives a goal
+ * from scratch. Either way the output is a single actionable sentence.
+ *
+ * Injected supervisor/system messages are filtered before the context window
+ * so they don't pollute the goal synthesis (they contain "Goal not yet reached"
+ * which would mislead the synthesiser into making a negative goal).
+ *
+ * GitHub Copilot equivalent: the user's issue/chat message IS the goal —
+ * no synthesis step needed because the task is already written by the user.
+ */
+
+export async function deriveGoal(
+  model: string,
+  messages: Message[],
+  existingGoal: string | null,
+  signal?: AbortSignal,
+): Promise<string> {
+  const INJECTED_PREFIXES = ["[supervisor]", "[autopilot]", "[System:"]
+  const userTurns = messages
+    .filter(m => m.role === "user" && typeof m.content === "string")
+    .filter(m => !INJECTED_PREFIXES.some(p => String(m.content).startsWith(p)))
+    .slice(-6)
+    .map(m => String(m.content).slice(0, 400))
+    .join("\n---\n")
+
+  const systemPrompt =
+    "You are a goal synthesizer for an AI coding agent. " +
+    "Produce a single precise, measurable, actionable goal in one sentence. " +
+    "Describe exactly what 'done' looks like. " +
+    "Reply with ONLY the goal text — no explanation, no preamble, no quotes."
+
+  const userPrompt = existingGoal
+    ? `Stated goal: ${existingGoal}\n\n${userTurns ? `Recent conversation:\n${userTurns}\n\n` : ""}Refine into a single precise, verifiable goal. What exactly does success look like?`
+    : `Conversation:\n${userTurns || "(no prior messages)"}\n\nWhat is the single most important goal to accomplish? State it precisely.`
+
+  const reply = await ollamaChat(
+    model,
+    [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+    [], undefined, undefined, signal,
+  )
+
+  const derived = (reply.content ?? "").trim().slice(0, 300)
+  return derived || existingGoal || "Complete the current task"
+}
+
 export async function checkGoal(model: string, goal: string, messages: Message[], signal?: AbortSignal): Promise<GoalVerdict> {
+  /**
+   * Goal judge — evaluates whether the agent's last response demonstrates
+   * that the goal has been met.
+   *
+   * DESIGN: spark uses a 1-stage judge (single LLM call → JSON verdict).
+   * Claude Code uses a 2-stage judge:
+   *   Stage 1: agent self-assessment → JSON with status/stuck/missing/evidence
+   *   Stage 2: external judge validates the self-assessment
+   * The 2-stage approach is more accurate but costs 2× inference rounds and
+   * requires a model large enough to reliably produce the structured schema.
+   * For small local Ollama models, a single focused judge call is more reliable.
+   *
+   * CONTEXT WINDOW: judge sees last real user message + last assistant message.
+   * - Injected [supervisor]/[autopilot]/[System:] messages are skipped when
+   *   finding lastUser — they contain "Goal not yet reached" which would
+   *   confuse the judge into a false negative.
+   * - Tool result messages are NOT included — the agent is responsible for
+   *   pasting evidence into its prose response (buildGoalBlock enforces this).
+   *   Including raw tool logs inflates the prompt and confuses small models;
+   *   CC's stop-hook judge reads the full transcript naturally, but our judge
+   *   receives a constructed prompt.
+   *
+   * GitHub Copilot equivalent: completion check is external (PR created + CI
+   * green + code review pass) rather than an LLM judge call.
+   *
+   * Ref: ~/workspace/agents-supervisor/core/assessment.mjs → buildJudgePrompt()
+   *      ~/workspace/blogposts/claude-code-stop-hook-reflection-judge.md
+   */
   const lastAssistant = [...messages].reverse().find(m => m.role === "assistant")?.content ?? ""
-  const tail = messages.slice(-6).map(m => {
-    const c = typeof m.content === "string" ? m.content.slice(0, 300) : ""
-    return `${m.role}: ${c}`
-  }).join("\n")
+  // Skip injected supervisor/system messages when finding the last real user message.
+  const INJECTED_PREFIXES = ["[supervisor]", "[autopilot]", "[System:"]
+  const lastUser = [...messages].reverse().find(
+    m => m.role === "user" &&
+    typeof m.content === "string" &&
+    !INJECTED_PREFIXES.some(p => (m.content as string).startsWith(p))
+  )?.content ?? ""
+  // The judge evaluates the agent's final claim — the agent is responsible for
+  // including evidence (test output, command results) in its response text.
+  // buildGoalBlock enforces this on the agent side. We don't re-parse tool msgs
+  // here because: (a) they're noisy/truncated, (b) good agents already summarise
+  // them in prose, (c) it inflates the judge prompt for small local models.
   const judgeSystem = "You are a strict goal supervisor for a coding agent. You judge whether a GOAL is fully accomplished based on the conversation. Be skeptical of unverified claims."
-  const judgeUser = `GOAL: ${goal}\n\nThe agent's final message:\n${lastAssistant}\n\nRecent transcript:\n${tail}\n\nIs the GOAL fully reached? Respond with ONLY a JSON object: {"reached": true|false, "feedback": "<if not reached, one concrete next action to push the agent forward; empty string if reached>"}`
+  const judgeUser = `GOAL: ${goal}\n\nLast user message:\n${typeof lastUser === "string" ? lastUser : ""}\n\nAgent's last message:\n${typeof lastAssistant === "string" ? lastAssistant : ""}\n\nIs the GOAL fully reached? Respond with ONLY a JSON object: {"reached": true|false, "feedback": "<if not reached, one concrete next action to push the agent forward; empty string if reached>"}`
   const reply = await ollamaChat(model, [
     { role: "system", content: judgeSystem },
     { role: "user", content: judgeUser },
@@ -1459,6 +1718,7 @@ async function main() {
   // Try saved model first, fall back to auto-pick
   const savedModel = await loadSavedModel()
   let currentModel: string
+  let thinkingEnabled = false
   if (savedModel && models.includes(savedModel)) {
     currentModel = savedModel
     console.log(`${COLORS.dim}Restored saved model: ${savedModel}${COLORS.reset}`)
@@ -1500,7 +1760,7 @@ async function main() {
   const messages: Message[] = [{ role: "system", content: systemPrompt }]
   let goal: string | null = await loadGoal()
   if (goal) {
-    messages[0].content += `\n\nCurrent goal: ${goal}`
+    messages[0].content += buildGoalBlock(goal)
   }
   let autopilot = false
   let phasedAutopilot = false
@@ -1593,22 +1853,74 @@ async function main() {
       continue
     }
 
+    if (trimmed.startsWith("/model ")) {
+      const name = trimmed.slice("/model ".length).trim()
+      if (name) {
+        currentModel = name
+        console.log(`Model set to ${name}`)
+      } else {
+        console.log(`Usage: /model <name>`)
+      }
+      continue
+    }
+
+    if (trimmed.startsWith("/think")) {
+      const arg = trimmed.slice("/think".length).trim()
+      if (arg === "on" || arg === "1" || arg === "true") {
+        thinkingEnabled = true
+        console.log(`Thinking mode ON — model will use extended reasoning (slower)`)
+      } else if (arg === "off" || arg === "0" || arg === "false" || arg === "") {
+        thinkingEnabled = false
+        console.log(`Thinking mode OFF`)
+      } else {
+        console.log(`Usage: /think on|off`)
+      }
+      continue
+    }
+
     if (trimmed === "/goal") {
       console.log(goal ? `goal: ${goal}` : `(no goal set)`)
       continue
     }
 
+    // /goal — user-defined completion condition
+    //
+    // How it compares to CC and Copilot:
+    //
+    //   GitHub Copilot: no /goal command — task IS the goal, set when
+    //     the session starts (from issue, chat message, API call).
+    //
+    //   Claude Code (/supervisor:goal <condition>):
+    //     - Stores goal in .supervisor/goals/<sessionId>.json (mode 0600)
+    //     - Fields: condition, status, attempts, tokenBaseline, startedAt, deadline
+    //     - Goal mode raises retry cap to DEFAULT_MAX_ATTEMPTS (16) and adds
+    //       a 30-min hard deadline
+    //     - Injects condition via buildGoalRequirementSection() into judge prompt
+    //     - /supervisor:goal clear|stop|off|reset|none|cancel all clear it
+    //
+    //   spark (/goal <text> | /goal clear):
+    //     - Stores in .agents/spark/goal (plain text, loads on startup)
+    //     - No deadline; bounded check cap (interactive=5, autopilot=50)
+    //     - Injects via buildGoalBlock() into system prompt — replaces any
+    //       prior block via regex strip so set/update/clear is idempotent
+    //     - Also pushes a user message anchoring the model to the goal
     if (trimmed.startsWith("/goal ")) {
       const arg = trimmed.slice("/goal ".length).trim()
       if (arg === "clear") {
         goal = null
         await clearGoal()
+        // Strip MANDATORY goal block from system prompt (block is always appended
+        // last via +=, so the greedy [\s\S]*$ match reliably removes it)
+        messages[0].content = messages[0].content.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
         console.log(`goal cleared`)
       } else {
         goal = arg
         await saveGoal(arg)
         console.log(`goal set: ${arg}`)
-        messages.push({ role: "user", content: `My current goal: ${arg}` })
+        // Replace any existing goal block, then append new one
+        messages[0].content = messages[0].content.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
+        messages[0].content += buildGoalBlock(arg)
+        messages.push({ role: "user", content: `My current goal: ${arg}\n\nThis goal is mandatory — I need you to work toward it and provide evidence when it is achieved.` })
       }
       continue
     }
@@ -1647,6 +1959,36 @@ async function main() {
       // fall through to agent loop
     }
 
+    // /autopilot — autonomous goal-driven loop
+    //
+    // How it compares to CC and Copilot:
+    //
+    //   GitHub Copilot: the cloud agent IS always in "autopilot" — it receives
+    //     a task, runs fully autonomously in a cloud VM, and exits by creating
+    //     a PR. No explicit on/off toggle needed; the whole system is async.
+    //     Output: "copilot: ● Started <task>" in the GitHub UI.
+    //
+    //   Claude Code autopilot mode (/supervisor autopilot or /supervisor:mode autopilot):
+    //     - Sets state.mode = 'autopilot', state.autopilot = true
+    //     - In autopilot mode the supervisor SKIPS the judge and always continues
+    //       (the opposite of spark — CC autopilot means "never stop")
+    //     - Uses the heartbeat Stop-hook pattern from agents-supervisor:
+    //       on each idle, a fresh sub-agent is launched with TASK + LATEST_REPLY
+    //       and decides DONE | CONTINUE independently of the live session
+    //
+    //   spark (/autopilot <task> | /autopilot on | /autopilot off):
+    //     - Uses the same judge loop as /goal, not CC's skip-judge autopilot
+    //     - Key addition: LLM derives the goal first (deriveGoal()), so the
+    //       user doesn't need to write a precise condition
+    //     - Prints "copilot: ● Started autopilot objective #N: <preview>"
+    //       (format borrowed from GitHub Copilot's cloud UI indicator)
+    //     - Increases tool round budget to 200 (vs 30 for interactive)
+    //     - Increases judge check cap to 50 (vs 5 for interactive)
+    //     - autopilot_exit tool lets the agent signal it's done and triggers
+    //       an AUTOPILOT_SUMMARY_PROMPT for a completion summary
+    //
+    // Ref: ~/workspace/agents-supervisor/SKILL.md (autopilot heartbeat)
+    //      ~/workspace/blogposts/claude-code-stop-hook-reflection-judge.md
     if (trimmed.startsWith("/repro ")) {
       const issueDesc = trimmed.slice("/repro ".length).trim()
       if (!issueDesc) { console.log(`Usage: /repro <issue description>`); continue }
@@ -1682,47 +2024,77 @@ Start with PHASE 1 now.`
       console.log(`${COLORS.cyan}repro mode ON — issue: ${issueDesc}${COLORS.reset}`)
       // fall through into agent loop
     }
-
     if (trimmed.startsWith("/autopilot ")) {
       const arg = trimmed.slice("/autopilot ".length).trim()
       if (arg === "off") {
         autopilot = false
+        phasedAutopilot = false
         console.log(`autopilot OFF`)
         continue
       }
 
       const isPhased = arg.startsWith("--phased ")
       autopilot = true
-
-      if (isPhased) {
-        const task = arg.slice("--phased ".length).trim()
-        const phasedPrompt = `You are in PHASED autopilot mode for this task: ${task}
-
-PHASE 1 — EXPLORE (read-only, WriteFile is locked):
-- Read relevant files, understand the codebase structure
-- Use Grep, ListSymbols, FindSymbol, ReadFile to map the relevant code
-- Do NOT attempt to write any files yet
-- When you fully understand what changes are needed, call phase_advance with a summary
-
-PHASE 2 — REPAIR (all tools available):
-- Implement the changes you identified in Phase 1
-- Run RunTests to verify after each significant change
-- Call autopilot_exit when done
-
-Start with PHASE 1 now.`
-        messages.push({ role: "user", content: phasedPrompt })
-        console.log(`${COLORS.cyan}phased autopilot ON — explore first, then repair${COLORS.reset}`)
-      } else {
-        messages.push({ role: "user", content: arg })
-        console.log(`autopilot ON — running autonomously until autopilot_exit or ${MAX_AUTOPILOT_REFLECTIONS} reflections`)
-      }
-      skipGenericPush = true
       phasedAutopilot = isPhased
+      skipGenericPush = true
+
+      // Include any inline task arg as staging context for goal derivation,
+      // but don't push it as a raw message — the kick-off message below replaces it.
+      const stagedArg = isPhased ? arg.slice("--phased ".length).trim() : arg
+      const stagingMessages: Message[] = stagedArg && stagedArg !== "on"
+        ? [...messages, { role: "user", content: stagedArg }]
+        : messages
+
+      process.stdout.write(`${COLORS.dim}deriving goal…${COLORS.reset}\r`)
+      const derived = await deriveGoal(currentModel, stagingMessages, goal)
+      goal = derived
+      await saveGoal(derived)
+
+      // Inject MANDATORY goal block into system prompt
+      messages[0].content = messages[0].content.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
+      messages[0].content += buildGoalBlock(derived)
+
+      const objectiveN = (await loadAutopilotCount()) + 1
+      await saveAutopilotCount(objectiveN)
+
+      const preview = derived.length > 80 ? derived.slice(0, 80) + "…" : derived
+      process.stdout.write("                              \r")
+      // Display format mirrors GitHub Copilot's cloud agent "● Started" indicator
+      console.log(`copilot: ${COLORS.green}●${COLORS.reset} Started autopilot objective #${objectiveN}: ${preview}`)
+
+      // Kick-off message anchors the agent to the refined goal from turn 1
+      messages.push({
+        role: "user",
+        content: `[autopilot] Objective #${objectiveN}: ${derived}\nWork toward this goal autonomously. Use tools.${isPhased ? " Start in EXPLORE phase. Read relevant files first, avoid WriteFile until you fully understand needed changes, then call phase_advance with a summary to enter repair phase." : ""} Provide evidence (command output, file contents, test results) when done. Call autopilot_exit only when the goal is fully achieved and verified.`,
+      })
       // fall through into the agent loop below by NOT continuing
     }
 
+    // Per-turn git context refresh: inject lightweight git state before each LLM call
+    let perTurnGitBlock: string | null = null
+    if (!skipGenericPush) {
+      const runGit = (cmd: string) =>
+        new Promise<string>((res) => {
+          const proc = spawn("sh", ["-c", cmd], { cwd: process.cwd(), stdio: ["ignore", "pipe", "ignore"] })
+          const chunks: Buffer[] = []
+          proc.stdout.on("data", (d: Buffer) => chunks.push(d))
+          proc.on("close", () => res(Buffer.concat(chunks).toString("utf-8").trim()))
+          proc.on("error", () => res(""))
+        })
+      const [diffStat, statusShort] = await Promise.all([
+        runGit("git diff --stat HEAD 2>/dev/null"),
+        runGit("git status --short 2>/dev/null"),
+      ])
+      if (diffStat || statusShort) {
+        perTurnGitBlock = `[Git: ${diffStat || "(no diff)"}\n${statusShort || ""}]`.trim()
+      }
+    }
+
     // Add user message
-    if (!skipGenericPush) messages.push({ role: "user", content: trimmed })
+    if (!skipGenericPush) {
+      const content = perTurnGitBlock ? `${perTurnGitBlock}\n\n${trimmed}` : trimmed
+      messages.push({ role: "user", content })
+    }
 
     // Agent loop: call model, handle tool calls, repeat until text response
     const tools = buildTools()
@@ -1736,7 +2108,9 @@ Start with PHASE 1 now.`
     const toolDefsForCall = tools.map((t) => t.definition)
     const toolMap = new Map(tools.map((t) => [t.definition.function.name, t]))
     const MAX_TOOL_ROUNDS = autopilot ? 200 : 30
-    const MAX_GOAL_CHECKS = 10
+    // Supervisor check cap: high for autopilot (user expects long run), small for
+    // interactive turns (prevents runaway if judge keeps returning reached:false).
+    const MAX_GOAL_CHECKS = autopilot ? 50 : 5
     let goalChecks = 0
 
     // Per-turn abort controller — Esc/Ctrl+C aborts and returns to prompt; Ctrl+Q exits
@@ -1762,6 +2136,36 @@ Start with PHASE 1 now.`
       pasteFilter.on("keypress", keypressHandler)
     }
 
+    // Doom loop detection: track last 3 tool calls (name + stringified args)
+    const recentToolCalls: string[] = []
+
+    // supervise: loop — the goal supervisor outer loop
+    //
+    // Structure: the inner for-loop runs the agent (model + tool calls) for up
+    // to MAX_TOOL_ROUNDS, then exits. The outer supervise: while(true) calls
+    // checkGoal() and either breaks (done / cap hit) or pushes a supervisor
+    // nudge and re-enters the inner loop for another batch of tool rounds.
+    //
+    // This mirrors Claude Code's Stop-hook pattern at a high level:
+    //   CC:    agent finishes turn → Stop hook fires → judge decides DONE|CONTINUE
+    //          → if CONTINUE, re-prompts the live session with feedback
+    //   spark: agent exhaust tool rounds → checkGoal fires inline → if not
+    //          reached, push escalating nudge → re-enter inner loop
+    //
+    // Key parameters:
+    //   MAX_TOOL_ROUNDS: 30 (interactive) | 200 (autopilot) — inner loop cap
+    //   MAX_GOAL_CHECKS: 5  (interactive) | 50  (autopilot) — outer loop cap
+    //
+    // CC uses DEFAULT_MAX_ATTEMPTS=16 with a 30-min deadline regardless of mode.
+    // spark separates interactive vs autopilot because interactive users expect
+    // the REPL to return control quickly; autopilot users expect long runs.
+    //
+    // Loop exits:
+    //   1. !goal           — no goal set, single pass only
+    //   2. goalChecks > cap — soft limit reached (print warning, return to REPL)
+    //   3. verdict.reached  — judge confirmed goal met
+    //   4. checkGoal throws — Ollama error, stop safely
+    //   5. turnAbort.signal.aborted — user pressed Esc/Ctrl+C
     supervise: while (true) {
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
         if (estimateTokens(messages) > COMPACT_THRESHOLD) {
@@ -1789,7 +2193,7 @@ Start with PHASE 1 now.`
               if (!contentStarted) contentStarted = true
               process.stdout.write(chunk)
             },
-          }, undefined, turnAbort.signal)
+          }, undefined, turnAbort.signal, thinkingEnabled)
 
           if (thinkingStarted && !contentStarted) process.stdout.write(`${COLORS.reset}`)
 
@@ -1840,6 +2244,15 @@ Start with PHASE 1 now.`
             console.log(`${COLORS.dim}${preview}${COLORS.reset}`)
 
             messages.push({ role: "tool", content: result, tool_name: toolName, tool_call_id: call.id })
+
+            // Doom loop detection: track identical tool+args combos
+            const callSig = toolName + JSON.stringify(toolArgs)
+            recentToolCalls.push(callSig)
+            if (recentToolCalls.length > 3) recentToolCalls.shift()
+            if (recentToolCalls.length === 3 && recentToolCalls[0] === recentToolCalls[1] && recentToolCalls[1] === recentToolCalls[2]) {
+              messages.push({ role: "user", content: `[System: You have called ${toolName} with identical arguments 3 times in a row. Change your approach — try a different tool or different arguments.]` })
+              recentToolCalls.length = 0
+            }
           }
           if (turnAbort.signal.aborted) break
           if (autopilotState.exited && !autopilotState.summarized) {
@@ -1859,11 +2272,11 @@ Start with PHASE 1 now.`
       }
 
       if (!goal) break supervise
-      if (goalChecks >= MAX_GOAL_CHECKS) {
-        console.log(`⚠ supervisor: goal not reached after ${MAX_GOAL_CHECKS} checks — stopping`)
+      goalChecks++
+      if (goalChecks > MAX_GOAL_CHECKS) {
+        console.log(`${COLORS.yellow}⚠ supervisor: reached ${MAX_GOAL_CHECKS} check limit${autopilot ? "" : " — use /autopilot for longer runs"}${COLORS.reset}`)
         break supervise
       }
-      goalChecks++
       let verdict: GoalVerdict
       try {
         verdict = await checkGoal(currentModel, goal, messages, turnAbort.signal)
@@ -1873,8 +2286,12 @@ Start with PHASE 1 now.`
       }
       if (turnAbort.signal.aborted) break supervise
       if (verdict.reached) { console.log(`✓ supervisor: goal reached`); break supervise }
-      console.log(`↻ supervisor (${goalChecks}/${MAX_GOAL_CHECKS}): ${verdict.feedback}`)
-      messages.push({ role: "user", content: `[supervisor] Goal not yet reached. ${verdict.feedback} Keep working toward the goal: ${goal}` })
+      // Soft milestone warnings
+      if (goalChecks === 5)  console.log(`${COLORS.yellow}⚠ supervisor: 5 checks — consider rephrasing goal or changing approach${COLORS.reset}`)
+      if (goalChecks === 10) console.log(`${COLORS.yellow}⚠ supervisor: 10 checks — if stuck, interrupt with Esc${COLORS.reset}`)
+      const nudge = buildSupervisorFeedback(goalChecks, goal, verdict.feedback)
+      console.log(`↻ supervisor (check ${goalChecks}): ${verdict.feedback}`)
+      messages.push({ role: "user", content: nudge })
     }
 
     process.off("SIGINT", sigintHandler)
