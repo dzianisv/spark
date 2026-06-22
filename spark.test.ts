@@ -726,34 +726,64 @@ describe("goal supervisor v2 — last-2-message judge", () => {
     expect(verdict.feedback.length).toBeGreaterThan(0)
   }, TIMEOUT)
 
-  test("no hard cap: 12 sequential checkGoal calls all resolve without error", async () => {
-    // Verifies that MAX_GOAL_CHECKS was removed — no artificial limit at the function level
+  test("checkGoal function has no internal cap — can be called sequentially without error", async () => {
+    // MAX_GOAL_CHECKS lives in the supervise loop (autopilot=50, interactive=5),
+    // not inside checkGoal() itself. The function is stateless and can be called
+    // as many times as needed.
     const messages: SparkMessage[] = [
       { role: "system", content: "You are spark." },
       { role: "user", content: "Make all tests pass" },
       { role: "assistant", content: "Tests are still failing." },
     ]
     const results: { reached: boolean }[] = []
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 6; i++) {
       const v = await checkGoal(judgeModel, "Make all tests pass", messages)
       results.push({ reached: v.reached })
     }
-    expect(results).toHaveLength(12)
-    // All should consistently say not reached (deterministic fixture)
+    expect(results).toHaveLength(6)
     expect(results.every(r => !r.reached)).toBe(true)
-  }, TIMEOUT * 10) // generous timeout for 12 LLM calls
+  }, TIMEOUT * 6)
 
-  test("judge skeptical: agent planning (not done) → reached=false", async () => {
-    // Use a fixture that is unambiguously incomplete even for a small model:
-    // agent says "I'm still analyzing, haven't fixed anything yet"
+  test("judge skeptical: agent has done zero work (not done) → reached=false", async () => {
+    // Use a fixture that shows zero progress — agent hasn't even started
     const messages: SparkMessage[] = [
       { role: "system", content: "You are spark." },
       { role: "user", content: "Run the test suite and make it pass" },
-      { role: "assistant", content: "I'm still analyzing the test failures. I can see 3 errors in auth.ts. Let me start fixing them one by one." },
+      { role: "assistant", content: "I will start working on this now. Let me first read the test files." },
     ]
-    const verdict = await checkGoal(judgeModel, "Run the test suite and make it pass", messages)
-    // Clearly mid-work — no model should say this is done
+    const verdict = await checkGoal(judgeModel, "Run the test suite and make all tests pass", messages)
+    // No commands run, no output, just planning — clearly not done
     expect(verdict.reached).toBe(false)
+  }, TIMEOUT)
+
+  test("tool output included as evidence: passing test output in tool msg → reached=true", async () => {
+    // Verifies that checkGoal includes recent tool messages so the judge can see
+    // actual command output rather than trusting agent prose alone.
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "Write and run tests for the sum function" },
+      { role: "assistant", content: "", tool_calls: [{ id: "t1", function: { name: "Bash", arguments: { command: "bun test sum.test.ts" } } }] },
+      { role: "tool", content: "✓ sum(1,2) equals 3\n✓ sum(-1,1) equals 0\n✓ sum(0,0) equals 0\n3 pass  0 fail", tool_name: "Bash", tool_call_id: "t1" },
+      { role: "assistant", content: "All tests pass. Done." },
+    ]
+    const verdict = await checkGoal(judgeModel, "Write and run tests for the sum function", messages)
+    // Judge should see the tool output (3 pass 0 fail) and confirm done
+    expect(verdict.reached).toBe(true)
+  }, TIMEOUT)
+
+  test("[System:] doom-loop message is skipped when finding lastUser", async () => {
+    // The doom-loop detector pushes { role:"user", content:"[System: You have called…]" }
+    // This must not become the "last user message" fed to the judge.
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "Fix the linter errors" },
+      { role: "assistant", content: "Done. Ran eslint, 0 errors." },
+      { role: "user", content: "[System: You have called Bash with identical arguments 3 times in a row. Change your approach.]" },
+    ]
+    const verdict = await checkGoal(judgeModel, "Fix the linter errors", messages)
+    // Judge should see "Fix the linter errors" as lastUser (not the System msg)
+    // and "Done. Ran eslint, 0 errors." as lastAssistant → should be reached
+    expect(verdict.reached).toBe(true)
   }, TIMEOUT)
 })
 

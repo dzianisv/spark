@@ -1238,9 +1238,10 @@ export async function deriveGoal(
   existingGoal: string | null,
   signal?: AbortSignal,
 ): Promise<string> {
+  const INJECTED_PREFIXES = ["[supervisor]", "[autopilot]", "[System:"]
   const userTurns = messages
     .filter(m => m.role === "user" && typeof m.content === "string")
-    .filter(m => !String(m.content).startsWith("[supervisor]") && !String(m.content).startsWith("[autopilot]"))
+    .filter(m => !INJECTED_PREFIXES.some(p => String(m.content).startsWith(p)))
     .slice(-6)
     .map(m => String(m.content).slice(0, 400))
     .join("\n---\n")
@@ -1267,16 +1268,23 @@ export async function deriveGoal(
 
 export async function checkGoal(model: string, goal: string, messages: Message[], signal?: AbortSignal): Promise<GoalVerdict> {
   const lastAssistant = [...messages].reverse().find(m => m.role === "assistant")?.content ?? ""
-  // Skip injected [supervisor] / [autopilot] messages when finding the last real user message —
-  // these contain "Goal not yet reached" which confuses the judge into a false negative.
+  // Skip injected supervisor/system messages when finding the last real user message.
+  const INJECTED_PREFIXES = ["[supervisor]", "[autopilot]", "[System:"]
   const lastUser = [...messages].reverse().find(
     m => m.role === "user" &&
     typeof m.content === "string" &&
-    !m.content.startsWith("[supervisor]") &&
-    !m.content.startsWith("[autopilot]")
+    !INJECTED_PREFIXES.some(p => (m.content as string).startsWith(p))
   )?.content ?? ""
+  // Include the last few tool results as evidence for the judge — this is what
+  // buildGoalBlock's evidence rule asks for: "commands run and their output".
+  const recentToolOutput = messages
+    .filter(m => m.role === "tool" && typeof m.content === "string")
+    .slice(-3)
+    .map(m => `[tool:${(m as {tool_name?: string}).tool_name ?? "?"}] ${String(m.content).slice(0, 400)}`)
+    .join("\n")
   const judgeSystem = "You are a strict goal supervisor for a coding agent. You judge whether a GOAL is fully accomplished based on the conversation. Be skeptical of unverified claims."
-  const judgeUser = `GOAL: ${goal}\n\nLast user message:\n${typeof lastUser === "string" ? lastUser : ""}\n\nAgent's last message:\n${typeof lastAssistant === "string" ? lastAssistant : ""}\n\nIs the GOAL fully reached? Respond with ONLY a JSON object: {"reached": true|false, "feedback": "<if not reached, one concrete next action to push the agent forward; empty string if reached>"}`
+  const evidenceSection = recentToolOutput ? `\nRecent tool output (evidence):\n${recentToolOutput}\n` : ""
+  const judgeUser = `GOAL: ${goal}\n\nLast user message:\n${typeof lastUser === "string" ? lastUser : ""}${evidenceSection}\nAgent's last message:\n${typeof lastAssistant === "string" ? lastAssistant : ""}\n\nIs the GOAL fully reached? Respond with ONLY a JSON object: {"reached": true|false, "feedback": "<if not reached, one concrete next action to push the agent forward; empty string if reached>"}`
   const reply = await ollamaChat(model, [
     { role: "system", content: judgeSystem },
     { role: "user", content: judgeUser },
@@ -1629,6 +1637,9 @@ async function main() {
     const toolDefsForCall = tools.map((t) => t.definition)
     const toolMap = new Map(tools.map((t) => [t.definition.function.name, t]))
     const MAX_TOOL_ROUNDS = autopilot ? 200 : 30
+    // Supervisor check cap: high for autopilot (user expects long run), small for
+    // interactive turns (prevents runaway if judge keeps returning reached:false).
+    const MAX_GOAL_CHECKS = autopilot ? 50 : 5
     let goalChecks = 0
 
     // Per-turn abort controller — Esc/Ctrl+C aborts and returns to prompt; Ctrl+Q exits
@@ -1763,6 +1774,10 @@ async function main() {
 
       if (!goal) break supervise
       goalChecks++
+      if (goalChecks > MAX_GOAL_CHECKS) {
+        console.log(`${COLORS.yellow}⚠ supervisor: reached ${MAX_GOAL_CHECKS} check limit${autopilot ? "" : " — use /autopilot for longer runs"}${COLORS.reset}`)
+        break supervise
+      }
       let verdict: GoalVerdict
       try {
         verdict = await checkGoal(currentModel, goal, messages, turnAbort.signal)
