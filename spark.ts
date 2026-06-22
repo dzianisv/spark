@@ -352,6 +352,14 @@ function truncateOutput(output: string, max = 30_000): string {
   return output.slice(0, half) + `\n\n...(${output.length - max} characters omitted)...\n\n` + output.slice(-half)
 }
 
+function truncateLines(output: string, maxLines = 200): string {
+  const lines = output.split("\n")
+  if (lines.length <= maxLines) return output
+  const kept = lines.slice(0, maxLines)
+  const omitted = lines.length - maxLines
+  return kept.join("\n") + `\n[...${omitted} lines omitted]`
+}
+
 function lineTrimmedMatch(content: string, find: string): { start: number; end: number } | null {
   const contentLines = content.split("\n")
   const findLines = find.split("\n")
@@ -381,7 +389,7 @@ function makeReadFile(): Tool {
       function: {
         name: "ReadFile",
         description:
-          "Read a file from disk. Returns numbered lines. For directories, lists entries. Use offset/limit for large files.",
+          "Read a file from disk. Returns numbered lines with a header showing total line count and current window. For directories, lists entries. Use offset/limit for large files.",
         parameters: {
           type: "object",
           properties: {
@@ -422,31 +430,33 @@ function makeReadFile(): Tool {
       })
 
       const shown = slice.length
-      const header = shown < total ? `(Showing lines ${offset}-${offset + shown - 1} of ${total})` : ""
-      return truncateOutput(numbered.join("\n") + (header ? `\n${header}` : ""))
+      const end = offset - 1 + shown
+      const header = `# ${filePath} | ${total} lines total | showing ${offset}-${end}`
+      return truncateOutput(header + "\n" + numbered.join("\n"))
     },
   }
 }
 
 async function checkedWrite(filePath: string, content: string): Promise<string | null> {
-  if (!filePath.endsWith(".ts") && !filePath.endsWith(".tsx")) return null
-  const tmpPath = join(dirname(filePath), `.spark-check-${Date.now()}.ts`)
-  try {
-    await writeFile(tmpPath, content, "utf-8")
-    const proc = Bun.spawn(["bun", "--check", tmpPath], { stdout: "pipe", stderr: "pipe" })
-    await proc.exited
-    await unlink(tmpPath).catch(() => {})
-    if (proc.exitCode !== 0) {
-      const err = await new Response(proc.stderr).text()
-      return `Syntax error: ${err.trim()}`
+  const ext = filePath.split(".").pop()?.toLowerCase()
+  if (ext === "ts" || ext === "tsx" || ext === "js" || ext === "jsx") {
+    const tmpPath = filePath + ".spark_check_tmp"
+    try {
+      await writeFile(tmpPath, content, "utf-8")
+      const checkProc = Bun.spawn(["bun", "--check", tmpPath], { stdout: "pipe", stderr: "pipe" })
+      const checkErr = await new Response(checkProc.stderr).text()
+      const checkCode = await checkProc.exited
+      await unlink(tmpPath).catch(() => {})
+      if (checkCode !== 0) {
+        const errMsg = checkErr.replace(new RegExp(tmpPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), filePath)
+        return `Error: syntax check failed before writing ${filePath}:\n${errMsg.slice(0, 1000)}`
+      }
+    } catch {
+      await unlink(tmpPath).catch(() => {})
     }
-    return null
-  } catch (e) {
-    await unlink(tmpPath).catch(() => {})
-    return `Syntax error: ${String(e)}`
   }
+  return null
 }
-
 function makeWriteFile(): Tool {
   return {
     definition: {
@@ -482,6 +492,8 @@ function makeWriteFile(): Tool {
 
         if (existing === null) {
           if (oldStr === "") {
+            const checkErr = await checkedWrite(filePath, newStr)
+            if (checkErr) return checkErr
             await writeFile(filePath, newStr, "utf-8")
             return `Created new file: ${filePath}`
           }
@@ -493,6 +505,8 @@ function makeWriteFile(): Tool {
 
         if (args.replaceAll) {
           const result = existing.replaceAll(oldStr, newStr)
+          const checkErr = await checkedWrite(filePath, result)
+          if (checkErr) return checkErr
           await writeFile(filePath, result, "utf-8")
           const count = (existing.split(oldStr).length - 1)
           return `Replaced ${count} occurrence(s) in ${filePath}`
@@ -505,6 +519,8 @@ function makeWriteFile(): Tool {
           if (firstIdx !== lastIdx)
             return `Error: found multiple matches for oldString. Use replaceAll or provide more context to make it unique.`
           const result = existing.slice(0, firstIdx) + newStr + existing.slice(firstIdx + oldStr.length)
+          const checkErr = await checkedWrite(filePath, result)
+          if (checkErr) return checkErr
           await writeFile(filePath, result, "utf-8")
           const oldLines = oldStr.split("\n").length
           const newLines = newStr.split("\n").length
@@ -515,6 +531,8 @@ function makeWriteFile(): Tool {
         const fuzzy = lineTrimmedMatch(existing, oldStr)
         if (fuzzy) {
           const result = existing.slice(0, fuzzy.start) + newStr + existing.slice(fuzzy.end)
+          const checkErr = await checkedWrite(filePath, result)
+          if (checkErr) return checkErr
           await writeFile(filePath, result, "utf-8")
           const oldLines = oldStr.split("\n").length
           const newLines = newStr.split("\n").length
@@ -529,6 +547,8 @@ function makeWriteFile(): Tool {
       const syntaxErr = await checkedWrite(filePath, content)
       if (syntaxErr) return syntaxErr
       const existing = await readFile(filePath, "utf-8").catch(() => null)
+      const checkErr = await checkedWrite(filePath, content)
+      if (checkErr) return checkErr
       await writeFile(filePath, content, "utf-8")
 
       if (existing === null) return `Created new file: ${filePath} (${content.split("\n").length} lines)`
@@ -580,7 +600,7 @@ function makeBash(): Tool {
         proc.on("close", (code) => {
           clearTimeout(timer)
           const output = Buffer.concat(chunks).toString("utf-8")
-          const truncated = truncateOutput(output)
+          const truncated = truncateOutput(truncateLines(output))
           const prefix = code !== 0 ? `[exit code: ${code}]\n` : ""
           done(prefix + truncated)
         })
@@ -699,7 +719,206 @@ function makeGrep(): Tool {
         const exitCode = await proc.exited
         if (exitCode === 1) return "No matches found."
         if (!output.trim()) return "No matches found."
-        return truncateOutput(output.trim())
+        return truncateLines(output.trim())
+      } catch {
+        return "Error: ripgrep (rg) not found. Install with: brew install ripgrep"
+      }
+    },
+  }
+}
+
+function makeRunTests(): Tool {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "RunTests",
+        description: "Auto-detect and run the project's test suite. Detects bun test, jest, pytest, go test, cargo test. Use after patching to verify correctness. Optionally filter by file or pattern.",
+        parameters: {
+          type: "object",
+          properties: {
+            filter: { type: "string", description: "Test file path or pattern to run (optional — runs all tests if omitted)" },
+            workdir: { type: "string", description: "Directory to run tests in (default: cwd)" },
+          },
+          required: [],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(args) {
+      const workdir = resolve(String(args.workdir ?? process.cwd()))
+      const filter = args.filter ? String(args.filter) : null
+
+      // Detect test runner
+      let cmd: string
+      const pkgPath = join(workdir, "package.json")
+      const pkgContent = await readFile(pkgPath, "utf-8").catch(() => null)
+      const hasBunLockb = await stat(join(workdir, "bun.lockb")).then(() => true).catch(() => false)
+      const hasPytest = await stat(join(workdir, "pytest.ini")).then(() => true).catch(() =>
+        stat(join(workdir, "pyproject.toml")).then(() => true).catch(() =>
+        stat(join(workdir, "setup.py")).then(() => true).catch(() => false)))
+      const hasGoMod = await stat(join(workdir, "go.mod")).then(() => true).catch(() => false)
+      const hasCargoToml = await stat(join(workdir, "Cargo.toml")).then(() => true).catch(() => false)
+
+      // Build spawn args arrays to avoid shell injection
+      let spawnCmd: string[]
+      if (pkgContent) {
+        const pkg = JSON.parse(pkgContent).scripts ?? {}
+        if (hasBunLockb || pkgContent.includes('"bun"')) {
+          spawnCmd = filter ? ["bun", "test", filter] : ["bun", "test"]
+          cmd = filter ? `bun test ${filter}` : "bun test"
+        } else if (pkg.test?.includes("jest") || pkgContent.includes('"jest"')) {
+          spawnCmd = filter ? ["npx", "jest", filter] : ["npx", "jest"]
+          cmd = filter ? `npx jest ${filter}` : "npx jest"
+        } else if (pkg.test) {
+          spawnCmd = filter ? ["npm", "test", "--", filter] : ["npm", "test"]
+          cmd = filter ? `npm test -- ${filter}` : "npm test"
+        } else {
+          spawnCmd = filter ? ["bun", "test", filter] : ["bun", "test"]
+          cmd = filter ? `bun test ${filter}` : "bun test"
+        }
+      } else if (hasPytest) {
+        spawnCmd = filter ? ["python", "-m", "pytest", filter, "-v"] : ["python", "-m", "pytest", "-v"]
+        cmd = filter ? `python -m pytest ${filter} -v` : "python -m pytest -v"
+      } else if (hasGoMod) {
+        spawnCmd = filter ? ["go", "test", "./...", "-run", filter] : ["go", "test", "./..."]
+        cmd = filter ? `go test ./... -run ${filter}` : "go test ./..."
+      } else if (hasCargoToml) {
+        spawnCmd = filter ? ["cargo", "test", filter] : ["cargo", "test"]
+        cmd = filter ? `cargo test ${filter}` : "cargo test"
+      } else {
+        spawnCmd = filter ? ["bun", "test", filter] : ["bun", "test"]
+        cmd = filter ? `bun test ${filter}` : "bun test"
+      }
+
+      return new Promise<string>((done) => {
+        const chunks: Buffer[] = []
+        const proc = spawn(spawnCmd[0], spawnCmd.slice(1), {
+          cwd: workdir,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env },
+        })
+        proc.stdout.on("data", (d: Buffer) => chunks.push(d))
+        proc.stderr.on("data", (d: Buffer) => chunks.push(d))
+        const timer = setTimeout(() => { proc.kill("SIGTERM"); setTimeout(() => proc.kill("SIGKILL"), 3000) }, 120_000)
+        proc.on("close", (code) => {
+          clearTimeout(timer)
+          const raw = Buffer.concat(chunks).toString("utf-8")
+          // Truncate to 150 lines
+          const lines = raw.split("\n")
+          const truncated = lines.length > 150
+            ? lines.slice(0, 150).join("\n") + `\n[...${lines.length - 150} lines omitted]`
+            : raw
+          const prefix = code !== 0 ? `[TESTS FAILED — exit code: ${code}]\n` : `[TESTS PASSED]\n`
+          done(prefix + `Command: ${cmd}\n\n` + truncated)
+        })
+        proc.on("error", (err) => done(`Error running tests: ${err.message}\nCommand: ${cmd}`))
+      })
+    },
+  }
+}
+
+function makeListSymbols(): Tool {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "ListSymbols",
+        description: "List top-level symbols (functions, classes, constants, types) defined in a file with their line numbers. Use to understand a file's structure without reading all content.",
+        parameters: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Absolute or relative path to the file" },
+          },
+          required: ["filePath"],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(args) {
+      const filePath = resolve(String(args.filePath))
+      const content = await readFile(filePath, "utf-8").catch(() => null)
+      if (!content) return `Error: file not found: ${filePath}`
+
+      const ext = filePath.split(".").pop()?.toLowerCase() ?? ""
+      const lines = content.split("\n")
+      const symbols: string[] = []
+
+      if (["ts", "tsx", "js", "jsx"].includes(ext)) {
+        // Match: export function/class/const/type/interface/enum, and non-export top-level function/class
+        const patterns = [
+          /^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+(\w+)/,
+          /^(?:export\s+)?class\s+(\w+)/,
+          /^(?:export\s+)?(?:const|let|var)\s+(\w+)/,
+          /^(?:export\s+)?(?:type|interface|enum)\s+(\w+)/,
+        ]
+        lines.forEach((line, i) => {
+          for (const pat of patterns) {
+            const m = line.match(pat)
+            if (m) { symbols.push(`${i + 1}: ${line.trim().slice(0, 80)}`); break }
+          }
+        })
+      } else if (["py"].includes(ext)) {
+        lines.forEach((line, i) => {
+          if (/^(?:async\s+)?def\s+\w+|^class\s+\w+/.test(line)) {
+            symbols.push(`${i + 1}: ${line.trim().slice(0, 80)}`)
+          }
+        })
+      } else {
+        // Generic: any line starting with word char at col 0 that looks like a definition
+        lines.forEach((line, i) => {
+          if (/^\w[\w\s*]*\(/.test(line) && !line.startsWith(" ") && !line.startsWith("\t")) {
+            symbols.push(`${i + 1}: ${line.trim().slice(0, 80)}`)
+          }
+        })
+      }
+
+      if (symbols.length === 0) return `No top-level symbols found in ${filePath}`
+      return `# ${filePath} — ${symbols.length} symbols\n` + symbols.join("\n")
+    },
+  }
+}
+
+function makeFindSymbol(): Tool {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "FindSymbol",
+        description: "Find where a function, class, or variable is defined across the codebase. Returns file paths and line numbers. Faster than Grep for finding symbol definitions.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Symbol name to search for (exact identifier)" },
+            path: { type: "string", description: "Directory to search in (default: cwd)" },
+            include: { type: "string", description: "File pattern filter e.g. '*.ts'" },
+          },
+          required: ["name"],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(args) {
+      const name = String(args.name)
+      const dir = resolve(String(args.path ?? process.cwd()))
+      const include = args.include ? String(args.include) : undefined
+
+      // Escape name to prevent regex injection
+      const safeName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      // Build a pattern that matches common definition forms
+      const defPattern = `(function\\s+${safeName}|class\\s+${safeName}|const\\s+${safeName}\\s*=|let\\s+${safeName}\\s*=|var\\s+${safeName}\\s*=|def\\s+${safeName}|type\\s+${safeName}\\s*=|interface\\s+${safeName}[\\s{]|enum\\s+${safeName}[\\s{])`
+
+      const rgArgs = ["--line-number", "--no-heading", "--color=never", "-e", defPattern]
+      if (include) rgArgs.push("--glob", include)
+      rgArgs.push(dir)
+
+      try {
+        const proc = Bun.spawn(["rg", ...rgArgs], { stdout: "pipe", stderr: "pipe" })
+        const output = await new Response(proc.stdout).text()
+        const exitCode = await proc.exited
+        if (exitCode === 1 || !output.trim()) return `No definition found for '${name}'`
+        const lines = output.trim().split("\n").slice(0, 50)
+        return lines.join("\n")
       } catch {
         return "Error: ripgrep (rg) not found. Install with: brew install ripgrep"
       }
@@ -856,29 +1075,30 @@ export function makeAutopilotExit(state: { exited: boolean }): Tool {
   }
 }
 
-function makePhaseAdvance(currentPhase: { value: number }): Tool {
+export function makePhaseAdvance(state: { phase: number }): Tool {
   return {
     definition: {
       type: "function",
       function: {
-        name: "PhaseAdvance",
-        description: "Advance to the next phase of the repair workflow (from locate to repair).",
+        name: "phase_advance",
+        description:
+          "Advance from current phase to next in phased autopilot. Call this when you have fully explored codebase and understand changes needed.",
         parameters: {
           type: "object",
-          properties: {},
-          required: [],
+          properties: {
+            summary: { type: "string", description: "Brief summary of what you learned in the exploration phase" },
+          },
+          required: ["summary"],
           additionalProperties: false,
         },
       },
     },
     async execute(_args: Record<string, unknown>): Promise<string> {
-      const newPhase = currentPhase.value + 1
-      currentPhase.value = newPhase
-      return `Phase advanced to ${newPhase}. You are now in the repair phase — proceed with WriteFile edits and RunTests verification.`
+      state.phase++
+      return `Phase advanced to ${state.phase}. You are now in the repair phase — proceed with WriteFile edits and RunTests verification.`
     },
   }
 }
-
 // ── Skill Scanner ────────────────────────────────────────────────────────────
 
 async function scanSkills(): Promise<Map<string, string>> {
@@ -903,18 +1123,18 @@ async function scanSkills(): Promise<Map<string, string>> {
 async function getSkillDescriptions(skillMap: Map<string, string>): Promise<string> {
   const lines: string[] = []
   for (const [name, path] of skillMap) {
-    const content = await readFile(path, "utf-8").catch(() => "")
-    // Try to extract description from YAML frontmatter
-    const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/)
+    const fd = await readFile(path, "utf-8").catch(() => "")
+    // Only read enough to extract description — first 40 lines covers any frontmatter
+    const preview = fd.split("\n").slice(0, 40).join("\n")
+    const fmMatch = preview.match(/^---\s*\n([\s\S]*?)\n---/)
     let desc = ""
     if (fmMatch) {
       const descMatch = fmMatch[1].match(/description:\s*(.+)/)
       if (descMatch) desc = descMatch[1].trim()
     }
     if (!desc) {
-      // Fallback: first non-heading, non-empty line
-      const bodyLines = content.split("\n").filter((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"))
-      desc = bodyLines[0]?.trim().slice(0, 100) ?? ""
+      const bodyLines = preview.split("\n").filter((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"))
+      desc = bodyLines[0]?.trim().slice(0, 120) ?? ""
     }
     lines.push(`- ${name}: ${desc}`)
   }
@@ -1058,6 +1278,7 @@ function buildSystemPrompt(agentInstructions: string, skillList: string, model: 
 - Prefer editing existing files over creating new ones.
 - If a task requires multiple independent tool calls, make them all at once.
 - Verify your work — run the code, check the output, confirm it works.
+- After patching code, call RunTests to verify correctness before declaring done.
 
 ## Available Skills
 Use LoadSkill to read a skill's full instructions when a task matches.
@@ -1521,7 +1742,10 @@ async function main() {
   const globTool = makeGlob()
   const grepTool = makeGrep()
   const loadSkillTool = makeLoadSkill(skillMap)
-  const coreTools = [readFileTool, writeFileTool, bashTool, evalTool, globTool, grepTool, loadSkillTool]
+  const runTestsTool = makeRunTests()
+  const listSymbolsTool = makeListSymbols()
+  const findSymbolTool = makeFindSymbol()
+  const coreTools = [readFileTool, writeFileTool, bashTool, evalTool, globTool, grepTool, runTestsTool, listSymbolsTool, findSymbolTool, loadSkillTool]
 
   // 4. Build system prompt
   const systemPrompt = buildSystemPrompt(agentInstructions, skillList, currentModel, gitContext)
@@ -1539,6 +1763,7 @@ async function main() {
     messages[0].content += buildGoalBlock(goal)
   }
   let autopilot = false
+  let phasedAutopilot = false
 
   printHeader(currentModel, skillMap.size)
 
@@ -1764,20 +1989,60 @@ async function main() {
     //
     // Ref: ~/workspace/agents-supervisor/SKILL.md (autopilot heartbeat)
     //      ~/workspace/blogposts/claude-code-stop-hook-reflection-judge.md
+    if (trimmed.startsWith("/repro ")) {
+      const issueDesc = trimmed.slice("/repro ".length).trim()
+      if (!issueDesc) { console.log(`Usage: /repro <issue description>`); continue }
+
+      autopilot = true
+      const reproPrompt = `You are in issue-reproduce-fix-verify mode for this issue:
+
+ISSUE: ${issueDesc}
+
+Work in EXACTLY this sequence — do not skip steps:
+
+PHASE 1 — REPRODUCE:
+1. Understand the issue from the description and codebase context.
+2. Write a minimal reproduction script (repro.sh or repro.ts/repro.py) that demonstrates the bug.
+3. Run it. If it does NOT fail/show the bug, revise and retry until it reliably reproduces the issue.
+4. When the repro script reliably fails, print: "REPRO CONFIRMED: <what it shows>"
+
+PHASE 2 — FIX:
+5. Locate the root cause in the codebase.
+6. Apply the fix.
+7. Run the repro script again. If it STILL fails, revise the fix and retry.
+8. When the repro script passes, print: "FIX VERIFIED"
+
+PHASE 3 — REGRESSION:
+9. Run RunTests to ensure existing tests still pass.
+10. If tests fail, fix them.
+11. Call autopilot_exit with a summary.
+
+Start with PHASE 1 now.`
+
+      messages.push({ role: "user", content: reproPrompt })
+      skipGenericPush = true
+      console.log(`${COLORS.cyan}repro mode ON — issue: ${issueDesc}${COLORS.reset}`)
+      // fall through into agent loop
+    }
     if (trimmed.startsWith("/autopilot ")) {
       const arg = trimmed.slice("/autopilot ".length).trim()
       if (arg === "off") {
         autopilot = false
+        phasedAutopilot = false
         console.log(`autopilot OFF`)
         continue
       }
+
+      const isPhased = arg.startsWith("--phased ")
       autopilot = true
+      phasedAutopilot = isPhased
       skipGenericPush = true
 
       // Include any inline task arg as staging context for goal derivation,
       // but don't push it as a raw message — the kick-off message below replaces it.
-      const stagingMessages: Message[] = arg && arg !== "on"
-        ? [...messages, { role: "user", content: arg }]
+      const stagedArg = isPhased ? arg.slice("--phased ".length).trim() : arg
+      const stagingMessages: Message[] = stagedArg && stagedArg !== "on"
+        ? [...messages, { role: "user", content: stagedArg }]
         : messages
 
       process.stdout.write(`${COLORS.dim}deriving goal…${COLORS.reset}\r`)
@@ -1800,7 +2065,7 @@ async function main() {
       // Kick-off message anchors the agent to the refined goal from turn 1
       messages.push({
         role: "user",
-        content: `[autopilot] Objective #${objectiveN}: ${derived}\nWork toward this goal autonomously. Use tools. Provide evidence (command output, file contents, test results) when done. Call autopilot_exit only when the goal is fully achieved and verified.`,
+        content: `[autopilot] Objective #${objectiveN}: ${derived}\nWork toward this goal autonomously. Use tools.${isPhased ? " Start in EXPLORE phase. Read relevant files first, avoid WriteFile until you fully understand needed changes, then call phase_advance with a summary to enter repair phase." : ""} Provide evidence (command output, file contents, test results) when done. Call autopilot_exit only when the goal is fully achieved and verified.`,
       })
       // fall through into the agent loop below by NOT continuing
     }
@@ -1834,7 +2099,11 @@ async function main() {
     // Agent loop: call model, handle tool calls, repeat until text response
     const tools = buildTools()
     const autopilotState = { exited: false, summarized: false }
+    const phaseState = { phase: 1 }
     if (autopilot) tools.push(makeAutopilotExit(autopilotState))
+    if (phasedAutopilot) {
+      tools.push(makePhaseAdvance(phaseState))
+    }
     let reflections = 0
     const toolDefsForCall = tools.map((t) => t.definition)
     const toolMap = new Map(tools.map((t) => [t.definition.function.name, t]))
@@ -1989,6 +2258,7 @@ async function main() {
           if (autopilotState.exited && !autopilotState.summarized) {
             autopilotState.summarized = true
             autopilot = false // exit returns to normal mode (blog: switch to build); re-arm with /autopilot
+            phasedAutopilot = false
             messages.push({ role: "user", content: AUTOPILOT_SUMMARY_PROMPT })
           }
         } catch (err: unknown) {
