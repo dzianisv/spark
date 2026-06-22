@@ -119,22 +119,31 @@ function pickModel(models: string[]): string {
   return [...models].sort((a, b) => score(b) - score(a))[0] ?? ""
 }
 
-async function ollamaChat(model: string, messages: { role: string; content: string }[]): Promise<string> {
-  const ac = new AbortController()
-  const timer = setTimeout(() => ac.abort(), 600_000) // 10-min timeout (qwen3.5 cold-load ~2-3min)
-  try {
-    const res = await fetch(`${OLLAMA_URL}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages, stream: false }),
-      signal: ac.signal,
-    })
-    if (!res.ok) throw new Error(`Ollama ${res.status}: ${await res.text()}`)
-    const d = await res.json() as { message: { content: string } }
-    return (d.message.content ?? "").trim()
-  } finally {
-    clearTimeout(timer)
+async function ollamaChat(model: string, messages: { role: string; content: string }[], retries = 3): Promise<string> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), 600_000) // 10-min per attempt
+    try {
+      const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model, messages, stream: false }),
+        signal: ac.signal,
+      })
+      if (!res.ok) throw new Error(`Ollama ${res.status}: ${await res.text()}`)
+      const d = await res.json() as { message: { content: string } }
+      return (d.message.content ?? "").trim()
+    } catch (err) {
+      clearTimeout(timer)
+      if (attempt === retries) throw err
+      const delay = attempt * 5000 // 5s, 10s backoff
+      process.stderr.write(`  [eval] ollamaChat attempt ${attempt} failed, retrying in ${delay/1000}s...\n`)
+      await new Promise(r => setTimeout(r, delay))
+    } finally {
+      clearTimeout(timer)
+    }
   }
+  throw new Error("unreachable")
 }
 
 async function getCommitId(): Promise<string> {

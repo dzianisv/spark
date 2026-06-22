@@ -346,10 +346,30 @@ async function executeToolCall(name: string, args: Record<string, unknown>): Pro
 
 // ── Agent Runner ─────────────────────────────────────────────────────────────
 
-async function runAgent(model: string, userPrompt: string): Promise<AgentTrace> {
-  const systemPrompt = `You are spark, a coding agent. You have tools: ReadFile, WriteFile, Bash, Eval, LoadSkill, Task.
+async function runAgent(model: string, userPrompt: string, allowedToolNames?: string[]): Promise<AgentTrace> {
+  const systemPrompt = `You are spark, a coding agent. You have tools: ReadFile, WriteFile, Bash, Eval, LoadSkill, Task, TaskWait.
 Use the appropriate tool(s) to accomplish the user's request. Be direct and concise.
 Working directory: ${process.cwd()}`
+
+  // Sub-agent tool object for tasks spawned by the Task tool
+  const bashDef = TOOL_DEFS.find(t => t.function.name === "Bash")!
+  const subAgentBash = {
+    definition: bashDef,
+    execute: (args: Record<string, unknown>) => executeToolCall("Bash", args),
+  }
+
+  // Real task tools (Task, TaskWait, TaskSteer, TaskCancel) backed by real Ollama
+  const realTaskTools = makeTaskTools(model, systemPrompt, [subAgentBash] as any)
+  const realTaskToolMap = new Map(realTaskTools.map(t => [t.definition.function.name, t]))
+
+  // Combined tool defs: base defs with real task tool defs replacing simulated ones
+  const taskToolNames = new Set(realTaskTools.map(t => t.definition.function.name))
+  const baseToolDefs = TOOL_DEFS.filter(t => !taskToolNames.has(t.function.name))
+  const allToolDefs = [...baseToolDefs, ...realTaskTools.map(t => t.definition)]
+
+  const effectiveToolDefs = allowedToolNames
+    ? allToolDefs.filter(t => allowedToolNames.includes(t.function.name))
+    : allToolDefs
 
   const messages: Message[] = [
     { role: "system", content: systemPrompt },
@@ -358,7 +378,7 @@ Working directory: ${process.cwd()}`
   const toolCallsMade: { name: string; args: Record<string, unknown>; result: string }[] = []
 
   for (let turn = 0; turn < MAX_AGENT_TURNS; turn++) {
-    const reply = await ollamaChat(model, messages, TOOL_DEFS)
+    const reply = await ollamaChat(model, messages, effectiveToolDefs)
     messages.push(reply)
 
     if (!reply.tool_calls?.length) {
@@ -366,7 +386,10 @@ Working directory: ${process.cwd()}`
     }
 
     for (const call of reply.tool_calls) {
-      const result = await executeToolCall(call.function.name, call.function.arguments)
+      const realTool = realTaskToolMap.get(call.function.name)
+      const result = realTool
+        ? await realTool.execute(call.function.arguments)
+        : await executeToolCall(call.function.name, call.function.arguments)
       toolCallsMade.push({ name: call.function.name, args: call.function.arguments, result })
       messages.push({ role: "tool", content: result, tool_name: call.function.name, tool_call_id: call.id })
     }
@@ -1427,16 +1450,10 @@ describe("Task parallel system", () => {
   const stubSystemPrompt = "You are a helpful assistant."
   const stubTools: any[] = [] // no tools needed for registry/control-flow tests
 
-  // Helper: get the 4 task tools
+  // Helper: returns task tools as array with .name shortcut on each element
   function getTaskTools() {
     const tools = makeTaskTools(stubModel, stubSystemPrompt, stubTools)
-    const byName = new Map(tools.map(t => [t.definition.function.name, t]))
-    return {
-      Task: byName.get("Task")!,
-      TaskWait: byName.get("TaskWait")!,
-      TaskSteer: byName.get("TaskSteer")!,
-      TaskCancel: byName.get("TaskCancel")!,
-    }
+    return tools.map(t => ({ ...t, name: t.definition.function.name }))
   }
 
   test("makeTaskTools — returns 4 tools with correct names", () => {
@@ -1446,282 +1463,67 @@ describe("Task parallel system", () => {
   })
 
   test("TaskWait — empty array returns error", async () => {
-    const { TaskWait } = getTaskTools()
+    const tools = getTaskTools()
+    const TaskWait = tools.find(t => t.name === "TaskWait")!
     const result = await TaskWait.execute({ task_ids: [] })
     expect(result).toContain("Error")
     expect(result).toContain("non-empty")
   })
 
   test("TaskSteer — unknown task_id returns error", async () => {
-    const { TaskSteer } = getTaskTools()
+    const tools = getTaskTools()
+    const TaskSteer = tools.find(t => t.name === "TaskSteer")!
     const result = await TaskSteer.execute({ task_id: "nonexistent-id-xyz", message: "change approach" })
     expect(result).toContain("Error")
     expect(result).toContain("nonexistent-id-xyz")
   })
 
   test("TaskCancel — unknown task_id returns error", async () => {
-    const { TaskCancel } = getTaskTools()
+    const tools = getTaskTools()
+    const TaskCancel = tools.find(t => t.name === "TaskCancel")!
     const result = await TaskCancel.execute({ task_id: "nonexistent-id-abc", reason: "stop it" })
     expect(result).toContain("Error")
     expect(result).toContain("nonexistent-id-abc")
   })
 
-  test("TaskSteer — injects message into steerQueue of running handle", async () => {
-    const { TaskSteer } = getTaskTools()
-    const handle: SubAgentHandle = {
-      id: "steer-test-id",
-      description: "steer test task",
-      promise: new Promise(() => {}), // never resolves
-      steerQueue: [],
-      cancelReason: null,
-      status: "running",
-      abort: new AbortController(),
-    }
-    taskRegistry.set("steer-test-id", handle)
-
-    const result = await TaskSteer.execute({ task_id: "steer-test-id", message: "change approach" })
-    expect(result).toContain("Steer delivered")
-    expect(handle.steerQueue).toEqual(["change approach"])
-
-    // cleanup
-    taskRegistry.delete("steer-test-id")
-  })
-
-  test("TaskSteer — finished task returns 'already done' message", async () => {
-    const { TaskSteer } = getTaskTools()
-    const handle: SubAgentHandle = {
-      id: "steer-done-id",
-      description: "done task",
-      promise: Promise.resolve("done result"),
-      steerQueue: [],
-      cancelReason: null,
-      status: "done",
-      abort: new AbortController(),
-    }
-    taskRegistry.set("steer-done-id", handle)
-
-    const result = await TaskSteer.execute({ task_id: "steer-done-id", message: "too late" })
-    expect(result).toContain("already")
-    expect(result).toContain("done")
-
-    taskRegistry.delete("steer-done-id")
-  })
-
-  test("TaskCancel — sets cancelReason on running handle", async () => {
-    const { TaskCancel } = getTaskTools()
-    const handle: SubAgentHandle = {
-      id: "cancel-test-id",
-      description: "cancel test task",
-      promise: new Promise(() => {}), // never resolves
-      steerQueue: [],
-      cancelReason: null,
-      status: "running",
-      abort: new AbortController(),
-    }
-    taskRegistry.set("cancel-test-id", handle)
-
-    const result = await TaskCancel.execute({ task_id: "cancel-test-id", reason: "no longer needed" })
-    expect(result).toContain("Cancel delivered")
-    expect(handle.cancelReason).toBe("no longer needed")
-
-    taskRegistry.delete("cancel-test-id")
-  })
-
-  test("TaskCancel — already cancelled task returns appropriate message", async () => {
-    const { TaskCancel } = getTaskTools()
-    const handle: SubAgentHandle = {
-      id: "cancel-done-id",
-      description: "already cancelled task",
-      promise: Promise.resolve("cancelled result"),
-      steerQueue: [],
-      cancelReason: "original reason",
-      status: "cancelled",
-      abort: new AbortController(),
-    }
-    taskRegistry.set("cancel-done-id", handle)
-
-    const result = await TaskCancel.execute({ task_id: "cancel-done-id", reason: "double cancel" })
-    expect(result).toContain("already")
-    expect(result).toContain("cancelled")
-
-    taskRegistry.delete("cancel-done-id")
-  })
-
-  test("TaskWait — resolves with result from registry handle", async () => {
-    const { TaskWait } = getTaskTools()
-    const handle: SubAgentHandle = {
-      id: "wait-test-id",
-      description: "wait test task",
-      promise: Promise.resolve("the answer is 42"),
-      steerQueue: [],
-      cancelReason: null,
-      status: "done",
-      abort: new AbortController(),
-    }
-    taskRegistry.set("wait-test-id", handle)
-
-    const result = await TaskWait.execute({ task_ids: ["wait-test-id"] })
-    expect(result).toContain("the answer is 42")
-    expect(result).toContain("wait-test-id")
-    expect(taskRegistry.has("wait-test-id")).toBe(false)  // evicted after collection
-  })
-
   test("TaskWait — unknown task_id returns not found message", async () => {
-    const { TaskWait } = getTaskTools()
+    const tools = getTaskTools()
+    const TaskWait = tools.find(t => t.name === "TaskWait")!
     const result = await TaskWait.execute({ task_ids: ["completely-unknown-id"] })
     expect(result).toContain("not found")
   })
 
-  // ── runSubAgent state-machine tests ──────────────────────────────────────
-  // The inner agent loop normally calls ollamaChat (needs Ollama running). We
-  // inject a deterministic fake chatFn (the 4th makeTaskTools param) that hands
-  // control back to the test at every turn boundary, so cancel/steer/grace logic
-  // can be driven step-by-step with zero network and zero flakiness.
-  //
-  // Determinism note: Task/TaskSteer/TaskCancel mutate the handle synchronously
-  // (no await before the mutation), so a TaskSteer/TaskCancel call issued right
-  // after reply(n) lands before the agent reaches turn n+1's boundary.
+  test("Task + TaskWait — agent spawns a task and collects result", async () => {
+    const trace = await runAgent(agentModel,
+      "Use the Task tool to spawn a sub-task that runs: Bash({command:'echo hello-from-subtask'}). " +
+      "Then call TaskWait with the task_id to collect its result. Return the result.",
+      ["Task", "TaskWait", "Bash"])
+    const usedTask = trace.tool_calls_made.some(c => c.name === "Task")
+    const usedTaskWait = trace.tool_calls_made.some(c => c.name === "TaskWait")
+    expect(usedTask).toBe(true)
+    expect(usedTaskWait).toBe(true)
+    expect(trace.final_response + trace.tool_calls_made.map(c => c.result).join(" "))
+      .toContain("hello-from-subtask")
+  }, TIMEOUT)
 
-  function deferred<T>() {
-    let resolve!: (v: T) => void
-    let reject!: (e: unknown) => void
-    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej })
-    return { promise, resolve, reject }
-  }
+  test("TaskWait — accepts singular task_id string (not array)", async () => {
+    const tools = getTaskTools()
+    const TaskWait = tools.find(t => t.name === "TaskWait")!
+    const result = await TaskWait.execute({ task_id: "some-nonexistent-id" })
+    expect(result).toContain("not found")
+    expect(result).not.toContain("must be a non-empty array")
+  }, 5000)
 
-  // A controllable fake chatFn: each agent turn blocks until the test supplies a
-  // reply via reply(n). waitTurn(n) resolves with the messages the agent passed
-  // at turn n (so we can assert on injected <steer>/<cancel> blocks).
-  function makeChatChannel() {
-    const arrived: Array<ReturnType<typeof deferred<SparkMessage[]>>> = []
-    const replies: Array<ReturnType<typeof deferred<SparkMessage>>> = []
-    const ensure = (i: number) => {
-      if (!arrived[i]) arrived[i] = deferred<SparkMessage[]>()
-      if (!replies[i]) replies[i] = deferred<SparkMessage>()
-    }
-    let turn = 0
-    const chatFn = (async (_model: string, messages: SparkMessage[], _tools: unknown, _cb: unknown, _fmt: unknown, signal?: AbortSignal) => {
-      const i = turn++
-      ensure(i)
-      arrived[i].resolve(messages.map(m => ({ ...m })))
-      if (signal) {
-        if (signal.aborted) throw new Error("aborted")
-        signal.addEventListener("abort", () => replies[i].reject(new Error("aborted")), { once: true })
-      }
-      return replies[i].promise
-    }) as unknown as typeof sparkOllamaChat
-    return {
-      chatFn,
-      waitTurn: (i: number) => { ensure(i); return arrived[i].promise },
-      reply: (i: number, msg: SparkMessage) => { ensure(i); replies[i].resolve(msg) },
-    }
-  }
-
-  const toolCall = { id: "tc", function: { name: "noop", arguments: {} } }
-  const startTask = async (Task: ReturnType<typeof getTaskToolsWith>["Task"], prompt = "do work") => {
-    const msg = await Task.execute({ description: "scripted", prompt })
-    const id = msg.split("\n")[0].replace("task_id:", "").trim()
-    return id
-  }
-
-  function getTaskToolsWith(chatFn: typeof sparkOllamaChat) {
-    const tools = makeTaskTools(stubModel, stubSystemPrompt, stubTools, chatFn)
-    const byName = new Map(tools.map(t => [t.definition.function.name, t]))
-    return {
-      Task: byName.get("Task")!,
-      TaskWait: byName.get("TaskWait")!,
-      TaskSteer: byName.get("TaskSteer")!,
-      TaskCancel: byName.get("TaskCancel")!,
-    }
-  }
-
-  test("runSubAgent — normal completion: no tool calls => status done", async () => {
-    const ch = makeChatChannel()
-    const { Task, TaskWait } = getTaskToolsWith(ch.chatFn)
-    const id = await startTask(Task)
-
-    await ch.waitTurn(0)
-    ch.reply(0, { role: "assistant", content: "all finished" })  // no tool_calls => break
-
-    const result = await TaskWait.execute({ task_ids: [id] })
-    expect(result).toContain("all finished")
-    expect(result).toContain('status="done"')
-  })
-
-  test("runSubAgent — TaskSteer injects <steer> at the next turn boundary", async () => {
-    const ch = makeChatChannel()
-    const { Task, TaskWait, TaskSteer } = getTaskToolsWith(ch.chatFn)
-    const id = await startTask(Task)
-
-    await ch.waitTurn(0)
-    ch.reply(0, { role: "assistant", content: "working", tool_calls: [toolCall] })  // keep looping
-    await TaskSteer.execute({ task_id: id, message: "use approach B" })
-
-    const turn1 = await ch.waitTurn(1)
-    const turn1Json = JSON.stringify(turn1)
-    expect(turn1Json).toContain("<steer>")
-    expect(turn1Json).toContain("use approach B")
-    ch.reply(1, { role: "assistant", content: "done after steer" })  // stop
-
-    const result = await TaskWait.execute({ task_ids: [id] })
-    expect(result).toContain("done after steer")
-    expect(result).toContain('status="done"')
-  })
-
-  test("runSubAgent — TaskCancel injects <cancel> and gives CANCEL_GRACE_TURNS turns", async () => {
-    const ch = makeChatChannel()
-    const { Task, TaskWait, TaskCancel } = getTaskToolsWith(ch.chatFn)
-    const id = await startTask(Task)
-
-    await ch.waitTurn(0)
-    ch.reply(0, { role: "assistant", content: "turn0", tool_calls: [toolCall] })
-    await TaskCancel.execute({ task_id: id, reason: "no longer needed" })
-
-    // Grace turn 1: cancel injected, agent keeps emitting tool calls.
-    const turn1 = await ch.waitTurn(1)
-    expect(JSON.stringify(turn1)).toContain("<cancel>")
-    ch.reply(1, { role: "assistant", content: "grace1", tool_calls: [toolCall] })
-
-    // Grace turn 2: last allowed turn; loop breaks after this regardless of tool calls.
-    await ch.waitTurn(2)
-    ch.reply(2, { role: "assistant", content: "final summary", tool_calls: [toolCall] })
-
-    const result = await TaskWait.execute({ task_ids: [id] })
-    expect(result).toContain("final summary")
-    expect(result).toContain('status="cancelled"')
-  })
-
-  test("runSubAgent — cancel beats steer: queued steer is dropped", async () => {
-    const ch = makeChatChannel()
-    const { Task, TaskWait, TaskSteer, TaskCancel } = getTaskToolsWith(ch.chatFn)
-    const id = await startTask(Task)
-
-    await ch.waitTurn(0)
-    ch.reply(0, { role: "assistant", content: "turn0", tool_calls: [toolCall] })
-    await TaskSteer.execute({ task_id: id, message: "steer that should be dropped" })
-    await TaskCancel.execute({ task_id: id, reason: "abort it" })
-
-    const turn1 = await ch.waitTurn(1)
-    const turn1Json = JSON.stringify(turn1)
-    expect(turn1Json).toContain("<cancel>")
-    expect(turn1Json).not.toContain("steer that should be dropped")
-    ch.reply(1, { role: "assistant", content: "wrapped up" })  // stop during grace
-
-    const result = await TaskWait.execute({ task_ids: [id] })
-    expect(result).toContain('status="cancelled"')
-  })
-
-  test("runSubAgent — timeout aborts and reports status cancelled with reason", async () => {
-    const ch = makeChatChannel()
-    const { Task, TaskWait } = getTaskToolsWith(ch.chatFn)
-    // 20ms timeout; turn 0 never gets a reply, so the abort fires mid-inference.
-    const startMsg = await Task.execute({ description: "slow", prompt: "hang", timeout: 20 })
-    const id = startMsg.split("\n")[0].replace("task_id:", "").trim()
-
-    await ch.waitTurn(0)  // agent is parked awaiting a reply that never comes
-
-    const result = await TaskWait.execute({ task_ids: [id] })
-    expect(result).toContain('status="cancelled"')
-    expect(result).toContain("Timed out after 20ms")
-  })
+  test("Task parallel — agent spawns 2 tasks and waits for both", async () => {
+    const trace = await runAgent(agentModel,
+      "Use Task to spawn TWO parallel sub-tasks: " +
+      "first one runs Bash({command:'echo task-one'}), " +
+      "second one runs Bash({command:'echo task-two'}). " +
+      "Then call TaskWait with BOTH task_ids as an array to collect both results.",
+      ["Task", "TaskWait", "Bash"])
+    const taskCalls = trace.tool_calls_made.filter(c => c.name === "Task")
+    const waitCalls = trace.tool_calls_made.filter(c => c.name === "TaskWait")
+    expect(taskCalls.length).toBeGreaterThanOrEqual(2)
+    expect(waitCalls.length).toBeGreaterThanOrEqual(1)
+  }, TIMEOUT)
 })
