@@ -121,7 +121,7 @@ function pickModel(models: string[]): string {
 
 async function ollamaChat(model: string, messages: { role: string; content: string }[]): Promise<string> {
   const ac = new AbortController()
-  const timer = setTimeout(() => ac.abort(), 120_000) // 2-min timeout per judge call
+  const timer = setTimeout(() => ac.abort(), 600_000) // 10-min timeout (qwen3.5 cold-load ~2-3min)
   try {
     const res = await fetch(`${OLLAMA_URL}/api/chat`, {
       method: "POST",
@@ -297,7 +297,7 @@ const FIXTURES: Fixture[] = [
       { role: "user", content: "[supervisor] Keep working." },
       { role: "assistant", content: "Attempt 3 failed: tests still broken." },
       { role: "user", content: "[supervisor] Keep working." },
-      { role: "assistant", content: "JWT refactor complete. All 8 auth tests pass. Token signing and verification confirmed. Done." },
+      { role: "assistant", content: "JWT refactor complete. Ran: bun test src/auth/ → 8 pass, 0 fail (sign, verify, refresh, revoke, middleware x4). auth.service.ts now uses jsonwebtoken RS256. auth.middleware.ts validates Bearer tokens. Output: ✓ auth.test.ts 8/8. Done." },
     ],
   },
 ]
@@ -321,10 +321,9 @@ async function runComparison(model: string): Promise<FixtureResult[]> {
   const results: FixtureResult[] = []
   for (const f of FIXTURES) {
     process.stdout.write(`  [${f.id}] ${f.description}… `)
-    const [before, after] = await Promise.all([
-      checkGoalBefore(model, f.goal, f.messages),
-      checkGoal(model, f.goal, f.messages),
-    ])
+    // Sequential — Ollama is single-GPU; concurrent calls just queue, doubling wall time
+    const before = await checkGoalBefore(model, f.goal, f.messages)
+    const after  = await checkGoal(model, f.goal, f.messages)
     const r: FixtureResult = {
       id: f.id,
       description: f.description,
