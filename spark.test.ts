@@ -78,9 +78,13 @@ async function getModels(): Promise<string[]> {
 function pickBestModel(models: string[]): string {
   const score = (n: string): number => {
     const l = n.toLowerCase()
-    if (l.includes("qwen3") || l.includes("qwen2.5-coder")) return 1000
+    if (l.includes("qwen3.5")) return 3000          // fits 8GB, best reasoning
+    if (l.includes("qwen3:14b") || l.includes("qwen3:8b")) return 2000
+    if (l.includes("qwen2.5-coder")) return 1800
+    if (l.includes("qwen3") && !l.includes("0.6")) return 1500
     if (l.includes("llama3") || l.includes("mistral") || l.includes("deepseek")) return 800
     if (l.includes("gemma") || l.includes("phi")) return 600
+    if (l.includes("qwen3:0.6")) return 100          // too small for G-Eval judging
     return 200
   }
   return [...models].sort((a, b) => score(b) - score(a))[0]
