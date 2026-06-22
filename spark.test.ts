@@ -998,10 +998,24 @@ describe("buildSupervisorFeedback", () => {
     expect(msg).toContain("start writing")
   })
 
+  test("check 4 — last firm level, not yet STOP PLANNING", () => {
+    const msg = buildSupervisorFeedback(4, "Fix the build", "")
+    expect(msg).toContain("4 checks")
+    expect(msg).toContain("start writing")
+    expect(msg).not.toContain("STOP PLANNING")
+  })
+
   test("check 5 — strong, demands concrete action", () => {
     const msg = buildSupervisorFeedback(5, "Create hello.ts", "")
     expect(msg).toContain("STOP PLANNING")
     expect(msg).toContain("5 checks")
+  })
+
+  test("check 9 — last STOP PLANNING level, not yet WARNING", () => {
+    const msg = buildSupervisorFeedback(9, "Write tests", "")
+    expect(msg).toContain("STOP PLANNING")
+    expect(msg).toContain("9 checks")
+    expect(msg).not.toContain("WARNING")
   })
 
   test("check 10 — final warning with autopilot_exit mention", () => {
@@ -1019,6 +1033,20 @@ describe("buildSupervisorFeedback", () => {
   test("feedback text is included in output", () => {
     const msg = buildSupervisorFeedback(1, "goal", "Run bun test first.")
     expect(msg).toContain("Run bun test first.")
+  })
+
+  test("check 4 vs check 5 — escalation jumps at boundary", () => {
+    const check4 = buildSupervisorFeedback(4, "goal", "")
+    const check5 = buildSupervisorFeedback(5, "goal", "")
+    expect(check4).not.toContain("STOP PLANNING")
+    expect(check5).toContain("STOP PLANNING")
+  })
+
+  test("check 9 vs check 10 — escalation jumps at boundary", () => {
+    const check9 = buildSupervisorFeedback(9, "goal", "")
+    const check10 = buildSupervisorFeedback(10, "goal", "")
+    expect(check9).not.toContain("WARNING")
+    expect(check10).toContain("WARNING")
   })
 
   test("empty feedback doesn't add extra space artifacts", () => {
