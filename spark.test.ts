@@ -1471,6 +1471,7 @@ describe("Task parallel system", () => {
       steerQueue: [],
       cancelReason: null,
       status: "running",
+      abort: new AbortController(),
     }
     taskRegistry.set("steer-test-id", handle)
 
@@ -1491,6 +1492,7 @@ describe("Task parallel system", () => {
       steerQueue: [],
       cancelReason: null,
       status: "done",
+      abort: new AbortController(),
     }
     taskRegistry.set("steer-done-id", handle)
 
@@ -1510,6 +1512,7 @@ describe("Task parallel system", () => {
       steerQueue: [],
       cancelReason: null,
       status: "running",
+      abort: new AbortController(),
     }
     taskRegistry.set("cancel-test-id", handle)
 
@@ -1529,6 +1532,7 @@ describe("Task parallel system", () => {
       steerQueue: [],
       cancelReason: "original reason",
       status: "cancelled",
+      abort: new AbortController(),
     }
     taskRegistry.set("cancel-done-id", handle)
 
@@ -1548,14 +1552,14 @@ describe("Task parallel system", () => {
       steerQueue: [],
       cancelReason: null,
       status: "done",
+      abort: new AbortController(),
     }
     taskRegistry.set("wait-test-id", handle)
 
     const result = await TaskWait.execute({ task_ids: ["wait-test-id"] })
     expect(result).toContain("the answer is 42")
     expect(result).toContain("wait-test-id")
-
-    taskRegistry.delete("wait-test-id")
+    expect(taskRegistry.has("wait-test-id")).toBe(false)  // evicted after collection
   })
 
   test("TaskWait — unknown task_id returns not found message", async () => {

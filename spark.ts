@@ -1127,8 +1127,9 @@ export interface SubAgentHandle {
   description: string
   promise: Promise<string>        // resolves when agent completes
   steerQueue: string[]            // messages to inject at next turn boundary
-  cancelReason: string | null     // set → graceful cancel in ≤2 turns
-  status: "running" | "done" | "cancelled"
+  cancelReason: string | null     // set → graceful cancel in ≤CANCEL_GRACE_TURNS turns
+  status: "running" | "done" | "cancelled" | "failed"
+  abort: AbortController          // for timeout and hard-abort
 }
 
 // Module-level registry — shared across all makeTaskTools() calls in a session
@@ -1175,44 +1176,54 @@ export function makeTaskTools(
       { role: "user", content: prompt },
     ]
     let lastContent = ""
+    let cancelInjected = false
     let graceRemaining = 0
 
-    for (let turn = 0; turn < MAX_TURNS; turn++) {
-      // 1. Consume cancel (highest priority) — matches opencode CANCEL_GRACE_TURNS
-      if (handle.cancelReason !== null && graceRemaining === 0) {
-        subMessages.push({ role: "user", content: renderCancel(handle.cancelReason) })
-        graceRemaining = CANCEL_GRACE_TURNS
-      }
-      if (graceRemaining > 0) {
-        graceRemaining--
-        if (graceRemaining === 0) {
-          handle.status = "cancelled"
-          break
+    try {
+      for (let turn = 0; turn < MAX_TURNS; turn++) {
+        // 1. Inject cancel once (highest priority) — mirrors opencode CANCEL_GRACE_TURNS
+        if (handle.cancelReason !== null && !cancelInjected) {
+          subMessages.push({ role: "user", content: renderCancel(handle.cancelReason) })
+          cancelInjected = true
+          graceRemaining = CANCEL_GRACE_TURNS
+          handle.steerQueue.length = 0  // cancel beats steer: drop pending steers (opencode semantics)
+        }
+
+        // 2. Consume steer — skip during cancel wind-down (opencode: cancel drops pending steers)
+        if (!cancelInjected) {
+          const steer = handle.steerQueue.shift()
+          if (steer) subMessages.push({ role: "user", content: renderSteer(steer) })
+        }
+
+        const reply = await ollamaChat(model, subMessages, toolDefs, undefined, undefined, handle.abort.signal)
+        subMessages.push(reply)
+        lastContent = reply.content
+
+        if (!reply.tool_calls?.length) break
+
+        for (const call of reply.tool_calls) {
+          const tool = toolMap.get(call.function.name)
+          const result = tool
+            ? await tool.execute(call.function.arguments)
+            : `Error: unknown tool '${call.function.name}'`
+          subMessages.push({ role: "tool", content: result, tool_name: call.function.name, tool_call_id: call.id })
+        }
+
+        // Decrement grace AFTER the LLM call + tool execution so agent gets exactly
+        // CANCEL_GRACE_TURNS full turns to wrap up (not CANCEL_GRACE_TURNS - 1)
+        if (graceRemaining > 0) {
+          graceRemaining--
+          if (graceRemaining === 0) break
         }
       }
-
-      // 2. Consume steer (matches opencode interrupt.consume() per-turn)
-      const steer = handle.steerQueue.shift()
-      if (steer) {
-        subMessages.push({ role: "user", content: renderSteer(steer) })
-      }
-
-      const reply = await ollamaChat(model, subMessages, toolDefs)
-      subMessages.push(reply)
-      lastContent = reply.content
-
-      if (!reply.tool_calls?.length) break
-
-      for (const call of reply.tool_calls) {
-        const tool = toolMap.get(call.function.name)
-        const result = tool
-          ? await tool.execute(call.function.arguments)
-          : `Error: unknown tool '${call.function.name}'`
-        subMessages.push({ role: "tool", content: result, tool_name: call.function.name, tool_call_id: call.id })
-      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (handle.status === "running") handle.status = "failed"
+      return `Error: ${msg}`
     }
 
-    handle.status = "done"
+    // Only overwrite status if still running — don't clobber "cancelled"/"failed"
+    if (handle.status === "running") handle.status = cancelInjected ? "cancelled" : "done"
     return truncateOutput(lastContent)
   }
 
@@ -1231,6 +1242,7 @@ export function makeTaskTools(
           properties: {
             description: { type: "string", description: "Short task description (3-5 words)" },
             prompt: { type: "string", description: "Detailed task instructions for the sub-agent" },
+            timeout: { type: "number", description: "Timeout in ms (default 300000 = 5min); aborts and cancels the subagent on expiry" },
           },
           required: ["description", "prompt"],
           additionalProperties: false,
@@ -1240,6 +1252,7 @@ export function makeTaskTools(
     async execute(args) {
       const prompt = String(args.prompt)
       const desc = String(args.description ?? "sub-task")
+      const timeout = Number(args.timeout ?? 300_000)
       const id = crypto.randomUUID()
 
       const handle: SubAgentHandle = {
@@ -1249,10 +1262,19 @@ export function makeTaskTools(
         steerQueue: [],
         cancelReason: null,
         status: "running",
+        abort: new AbortController(),
       }
 
+      // Timeout: abort the in-flight ollamaChat and inject cancel message
+      const timeoutId = setTimeout(() => {
+        if (handle.status === "running") {
+          handle.cancelReason = `Timed out after ${timeout}ms`
+          handle.abort.abort()
+        }
+      }, timeout)
+
       process.stderr.write(`\x1b[90m[Task: ${desc}] started (id: ${id})\x1b[0m\n`)
-      handle.promise = runSubAgent(handle, prompt)
+      handle.promise = runSubAgent(handle, prompt).finally(() => clearTimeout(timeoutId))
       taskRegistry.set(id, handle)
 
       return `task_id: ${id}\nTask "${desc}" started in background. Call TaskWait(["${id}"]) to collect the result, or call more Tasks first to run them in parallel.`
@@ -1283,16 +1305,20 @@ export function makeTaskTools(
       const ids = (args.task_ids as string[]) ?? []
       if (!ids.length) return "Error: task_ids must be a non-empty array"
 
-      const results = await Promise.all(
+      // allSettled so one failed task doesn't discard sibling results
+      const settled = await Promise.allSettled(
         ids.map(async (id) => {
           const handle = taskRegistry.get(id)
           if (!handle) return `task_id ${id}: not found`
           const result = await handle.promise
+          taskRegistry.delete(id)  // evict after collecting to prevent unbounded growth
           return `<task_result task_id="${id}" description="${handle.description}" status="${handle.status}">\n${result}\n</task_result>`
         }),
       )
 
-      return results.join("\n\n")
+      return settled
+        .map(r => r.status === "fulfilled" ? r.value : `<task_result status="failed">\nError: ${(r as PromiseRejectedResult).reason}\n</task_result>`)
+        .join("\n\n")
     },
   }
 
