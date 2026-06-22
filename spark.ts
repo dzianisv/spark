@@ -957,24 +957,150 @@ function makeLoadSkill(skillMap: Map<string, string>): Tool {
   }
 }
 
-function makeTask(
+// ── Parallel Task Registry ────────────────────────────────────────────────────
+//
+// Design: background subagent system inspired by:
+//
+// opencode (packages/opencode/src/tool/task.ts):
+//   - Task() creates a child Session with parentID, runs via ops.prompt() (awaited Effect fiber)
+//   - Returns task_id (session UUID) in result; parent can pass task_id to resume
+//   - Parallel: LLM emits multiple Task tool_calls in one turn → Effect forks them concurrently
+//
+// opencode (packages/opencode/src/tool/task-interrupt.ts):
+//   - task_steer: injects into Interrupt.Service (shared in-memory Map<sessionID,Pending>)
+//   - Child polls interrupt.consume(sessionID) at EVERY turn boundary
+//   - Steer formats as: <steer><reason>...</reason></steer> injected as a user message
+//   - Cancel formats as: <cancel><reason>...</reason></cancel>; child wraps up in CANCEL_GRACE_TURNS=2
+//   - task_abort: hard stop via Effect interrupt (no grace turns)
+//
+// opencode (packages/opencode/src/session/interrupt.ts):
+//   - Interrupt.request() writes to pending Map (cancel wins over steer if already queued)
+//   - Interrupt.consume() reads+deletes from pending; child calls this each turn
+//
+// CC (agents-supervisor/core/assessment.mjs):
+//   - No real-time steering; judge acts AFTER subagent completes
+//   - Parallelism: caller launches multiple subagent Promise chains simultaneously
+//
+// GitHub Copilot:
+//   - No real-time steering or mid-run injection
+//   - Task IS the session; each Copilot CLI invocation is one agent
+//
+// spark model (this file):
+//   - Task() starts a background subagent loop, returns task_id immediately
+//   - TaskWait(task_ids) blocks until tasks complete, returns aggregated results
+//   - TaskSteer(task_id, message) injects at next turn boundary (polls steerQueue)
+//   - TaskCancel(task_id, reason) sets cancelled flag; subagent wraps up in ≤2 turns
+//   - Parallelism: parent calls Task() N times, then TaskWait([id1,id2,...]) → N agents run concurrently
+
+export interface SubAgentHandle {
+  id: string
+  description: string
+  promise: Promise<string>        // resolves when agent completes
+  steerQueue: string[]            // messages to inject at next turn boundary
+  cancelReason: string | null     // set → graceful cancel in ≤2 turns
+  status: "running" | "done" | "cancelled"
+}
+
+// Module-level registry — shared across all makeTaskTools() calls in a session
+export const taskRegistry = new Map<string, SubAgentHandle>()
+
+// Render helpers matching opencode's interrupt.ts format
+function renderSteer(reason: string): string {
+  return [
+    "<steer>",
+    "A course correction from your orchestrator. Adjust your approach accordingly, then continue your task.",
+    `<reason>${reason}</reason>`,
+    "</steer>",
+  ].join("\n")
+}
+
+function renderCancel(reason: string): string {
+  return [
+    "<cancel>",
+    "Your orchestrator is stopping this task. Wrap up now: briefly summarise what you completed and what remains, then stop. Do not start new work.",
+    `<reason>${reason}</reason>`,
+    "</cancel>",
+  ].join("\n")
+}
+
+const CANCEL_GRACE_TURNS = 2
+
+export function makeTaskTools(
   model: string,
   systemPrompt: string,
   tools: Tool[],
-): Tool {
-  return {
+): Tool[] {
+  // Sub-agent tools: everything EXCEPT Task-family (no recursive spawning)
+  const taskNames = new Set(["Task", "TaskWait", "TaskSteer", "TaskCancel"])
+  const subTools = tools.filter(t => !taskNames.has(t.definition.function.name))
+  const toolDefs = subTools.map(t => t.definition)
+  const toolMap = new Map(subTools.map(t => [t.definition.function.name, t]))
+
+  const MAX_TURNS = 20
+
+  // ── Inner agent loop (runs in background via fire-and-forget Promise) ────
+  async function runSubAgent(handle: SubAgentHandle, prompt: string): Promise<string> {
+    const subMessages: Message[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: prompt },
+    ]
+    let lastContent = ""
+    let graceRemaining = 0
+
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
+      // 1. Consume cancel (highest priority) — matches opencode CANCEL_GRACE_TURNS
+      if (handle.cancelReason !== null && graceRemaining === 0) {
+        subMessages.push({ role: "user", content: renderCancel(handle.cancelReason) })
+        graceRemaining = CANCEL_GRACE_TURNS
+      }
+      if (graceRemaining > 0) {
+        graceRemaining--
+        if (graceRemaining === 0) {
+          handle.status = "cancelled"
+          break
+        }
+      }
+
+      // 2. Consume steer (matches opencode interrupt.consume() per-turn)
+      const steer = handle.steerQueue.shift()
+      if (steer) {
+        subMessages.push({ role: "user", content: renderSteer(steer) })
+      }
+
+      const reply = await ollamaChat(model, subMessages, toolDefs)
+      subMessages.push(reply)
+      lastContent = reply.content
+
+      if (!reply.tool_calls?.length) break
+
+      for (const call of reply.tool_calls) {
+        const tool = toolMap.get(call.function.name)
+        const result = tool
+          ? await tool.execute(call.function.arguments)
+          : `Error: unknown tool '${call.function.name}'`
+        subMessages.push({ role: "tool", content: result, tool_name: call.function.name, tool_call_id: call.id })
+      }
+    }
+
+    handle.status = "done"
+    return truncateOutput(lastContent)
+  }
+
+  // ── Task tool: start a background subagent, return task_id immediately ───
+  const taskTool: Tool = {
     definition: {
       type: "function",
       function: {
         name: "Task",
         description:
-          "Spawn a sub-agent to handle a complex task. The sub-agent has access to file, shell, and eval tools but cannot spawn further sub-agents. Use for delegating independent work.",
+          "Start a background subagent to handle an independent task. Returns a task_id immediately. " +
+          "Use TaskWait to collect results. Spawn multiple Tasks then TaskWait([id1,id2,...]) to run in parallel. " +
+          "Sub-agents cannot spawn further sub-agents.",
         parameters: {
           type: "object",
           properties: {
             description: { type: "string", description: "Short task description (3-5 words)" },
             prompt: { type: "string", description: "Detailed task instructions for the sub-agent" },
-            timeout: { type: "number", description: "Timeout in milliseconds (default: 300000 = 5 min)" },
           },
           required: ["description", "prompt"],
           additionalProperties: false,
@@ -984,51 +1110,129 @@ function makeTask(
     async execute(args) {
       const prompt = String(args.prompt)
       const desc = String(args.description ?? "sub-task")
-      const timeout = Number(args.timeout ?? 300_000)
-      process.stderr.write(`\x1b[90m[Task: ${desc}]\x1b[0m\n`)
+      const id = crypto.randomUUID()
 
-      // Sub-agent tools: everything EXCEPT Task (no recursive spawning)
-      const subTools = tools.filter(t => t.definition.function.name !== "Task")
-
-      const subMessages: Message[] = [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: prompt },
-      ]
-
-      const toolDefs = subTools.map((t) => t.definition)
-      const toolMap = new Map(subTools.map((t) => [t.definition.function.name, t]))
-      const MAX_TURNS = 20
-      const deadline = Date.now() + timeout
-      let lastContent = ""
-
-      for (let turn = 0; turn < MAX_TURNS; turn++) {
-        if (Date.now() > deadline) {
-          return `<task_result task="${desc}">\nTask timed out after ${timeout}ms\n</task_result>`
-        }
-
-        const reply = await ollamaChat(model, subMessages, toolDefs)  // no streaming callbacks for sub-agents
-        subMessages.push(reply)
-        lastContent = reply.content
-
-        if (!reply.tool_calls?.length) {
-          return `<task_result task="${desc}">\n${truncateOutput(reply.content)}\n</task_result>`
-        }
-
-        for (const call of reply.tool_calls) {
-          if (Date.now() > deadline) {
-            return `<task_result task="${desc}">\nTask timed out after ${timeout}ms\n</task_result>`
-          }
-          const tool = toolMap.get(call.function.name)
-          const result = tool
-            ? await tool.execute(call.function.arguments)
-            : `Error: unknown tool '${call.function.name}'`
-          subMessages.push({ role: "tool", content: result, tool_name: call.function.name, tool_call_id: call.id })
-        }
+      const handle: SubAgentHandle = {
+        id,
+        description: desc,
+        promise: Promise.resolve(""),  // placeholder; replaced below
+        steerQueue: [],
+        cancelReason: null,
+        status: "running",
       }
 
-      return `<task_result task="${desc}">\nReached max turns (${MAX_TURNS}). Last response:\n${truncateOutput(lastContent)}\n</task_result>`
+      process.stderr.write(`\x1b[90m[Task: ${desc}] started (id: ${id})\x1b[0m\n`)
+      handle.promise = runSubAgent(handle, prompt)
+      taskRegistry.set(id, handle)
+
+      return `task_id: ${id}\nTask "${desc}" started in background. Call TaskWait(["${id}"]) to collect the result, or call more Tasks first to run them in parallel.`
     },
   }
+
+  // ── TaskWait: block until one or more tasks complete ─────────────────────
+  // opencode equivalent: the Effect.promise that wraps ops.prompt() in task.ts
+  const taskWaitTool: Tool = {
+    definition: {
+      type: "function",
+      function: {
+        name: "TaskWait",
+        description:
+          "Wait for one or more background tasks to complete. Pass the task_ids returned by Task. " +
+          "Returns all results when all tasks are done. Run tasks in parallel by calling Task multiple times before TaskWait.",
+        parameters: {
+          type: "object",
+          properties: {
+            task_ids: { type: "array", items: { type: "string" }, description: "Array of task_id strings returned by Task" },
+          },
+          required: ["task_ids"],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(args) {
+      const ids = (args.task_ids as string[]) ?? []
+      if (!ids.length) return "Error: task_ids must be a non-empty array"
+
+      const results = await Promise.all(
+        ids.map(async (id) => {
+          const handle = taskRegistry.get(id)
+          if (!handle) return `task_id ${id}: not found`
+          const result = await handle.promise
+          return `<task_result task_id="${id}" description="${handle.description}" status="${handle.status}">\n${result}\n</task_result>`
+        }),
+      )
+
+      return results.join("\n\n")
+    },
+  }
+
+  // ── TaskSteer: inject course correction at next turn boundary ─────────────
+  // Mirrors opencode task_steer → Interrupt.request(intent:"steer") →
+  // renderSteer() injected as user message at child's next turn start.
+  const taskSteerTool: Tool = {
+    definition: {
+      type: "function",
+      function: {
+        name: "TaskSteer",
+        description:
+          "Send a course correction to a running background task. The message is injected at the task's next turn boundary. " +
+          "Use when the task is headed in the wrong direction but you don't want to cancel it. (Mirrors opencode task_steer.)",
+        parameters: {
+          type: "object",
+          properties: {
+            task_id: { type: "string", description: "task_id of the running task to steer" },
+            message: { type: "string", description: "Course-correction instruction for the subagent" },
+          },
+          required: ["task_id", "message"],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(args) {
+      const id = String(args.task_id)
+      const message = String(args.message)
+      const handle = taskRegistry.get(id)
+      if (!handle) return `Error: no task with id '${id}'`
+      if (handle.status !== "running") return `Task ${id} is already ${handle.status}; nothing to steer.`
+      handle.steerQueue.push(message)
+      return `Steer delivered to task ${id} ("${handle.description}"). Will apply at next turn boundary.`
+    },
+  }
+
+  // ── TaskCancel: graceful stop in ≤CANCEL_GRACE_TURNS turns ───────────────
+  // Mirrors opencode task_cancel → Interrupt.request(intent:"cancel") →
+  // renderCancel() injected → child wraps up in CANCEL_GRACE_TURNS=2 turns.
+  const taskCancelTool: Tool = {
+    definition: {
+      type: "function",
+      function: {
+        name: "TaskCancel",
+        description:
+          "Request graceful cancellation of a running background task. The task gets up to 2 turns to wrap up and summarise. " +
+          "The task_id remains in the registry; use TaskWait to collect its final summary. (Mirrors opencode task_cancel.)",
+        parameters: {
+          type: "object",
+          properties: {
+            task_id: { type: "string", description: "task_id of the running task to cancel" },
+            reason: { type: "string", description: "Why the task should stop" },
+          },
+          required: ["task_id", "reason"],
+          additionalProperties: false,
+        },
+      },
+    },
+    async execute(args) {
+      const id = String(args.task_id)
+      const reason = String(args.reason)
+      const handle = taskRegistry.get(id)
+      if (!handle) return `Error: no task with id '${id}'`
+      if (handle.status !== "running") return `Task ${id} is already ${handle.status}.`
+      handle.cancelReason = reason
+      return `Cancel delivered to task ${id} ("${handle.description}"). Will apply at next turn boundary (up to ${CANCEL_GRACE_TURNS} grace turns).`
+    },
+  }
+
+  return [taskTool, taskWaitTool, taskSteerTool, taskCancelTool]
 }
 
 // ── Autopilot ────────────────────────────────────────────────────────────────
@@ -1750,10 +1954,10 @@ async function main() {
   // 4. Build system prompt
   const systemPrompt = buildSystemPrompt(agentInstructions, skillList, currentModel, gitContext)
 
-  // 5. Build full tool set with Task having a lazy systemPrompt reference
+  // 5. Build full tool set with Task-family tools having a lazy systemPrompt reference
   const buildTools = () => {
-    const taskTool = makeTask(currentModel, systemPrompt, coreTools)
-    return [...coreTools, taskTool]
+    const taskTools = makeTaskTools(currentModel, systemPrompt, coreTools)
+    return [...coreTools, ...taskTools]
   }
 
   // 6. Init conversation

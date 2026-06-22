@@ -3,8 +3,8 @@
 // Requires: Ollama running with at least one model
 
 import { test, expect, beforeAll, describe } from "bun:test"
-import { parseVerdict, checkGoal, deriveGoal, buildGoalBlock, buildSupervisorFeedback, makeAutopilotExit, AUTOPILOT_NUDGE, MAX_AUTOPILOT_REFLECTIONS, AUTOPILOT_SUMMARY_PROMPT, estimateTokens, splitTurns, compactMessages, TAIL_TURNS, ollamaChat as sparkOllamaChat } from "./spark.ts"
-import type { Message as SparkMessage } from "./spark.ts"
+import { parseVerdict, checkGoal, deriveGoal, buildGoalBlock, buildSupervisorFeedback, makeAutopilotExit, AUTOPILOT_NUDGE, MAX_AUTOPILOT_REFLECTIONS, AUTOPILOT_SUMMARY_PROMPT, estimateTokens, splitTurns, compactMessages, TAIL_TURNS, ollamaChat as sparkOllamaChat, taskRegistry, makeTaskTools } from "./spark.ts"
+import type { Message as SparkMessage, SubAgentHandle } from "./spark.ts"
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -1413,4 +1413,154 @@ describe("deriveGoal", () => {
     // If model returned empty, we'd get the existing goal back
     console.log(`  derived (with existing fallback): "${goal}"`)
   }, TIMEOUT)
+})
+
+// ── Task Parallel System Tests ────────────────────────────────────────────────
+
+describe("Task parallel system", () => {
+  // Minimal stub tools for makeTaskTools
+  const stubModel = "stub"
+  const stubSystemPrompt = "You are a helpful assistant."
+  const stubTools: any[] = [] // no tools needed for registry/control-flow tests
+
+  // Helper: get the 4 task tools
+  function getTaskTools() {
+    const tools = makeTaskTools(stubModel, stubSystemPrompt, stubTools)
+    const byName = new Map(tools.map(t => [t.definition.function.name, t]))
+    return {
+      Task: byName.get("Task")!,
+      TaskWait: byName.get("TaskWait")!,
+      TaskSteer: byName.get("TaskSteer")!,
+      TaskCancel: byName.get("TaskCancel")!,
+    }
+  }
+
+  test("makeTaskTools — returns 4 tools with correct names", () => {
+    const tools = makeTaskTools(stubModel, stubSystemPrompt, stubTools)
+    const names = tools.map(t => t.definition.function.name)
+    expect(names).toEqual(["Task", "TaskWait", "TaskSteer", "TaskCancel"])
+  })
+
+  test("TaskWait — empty array returns error", async () => {
+    const { TaskWait } = getTaskTools()
+    const result = await TaskWait.execute({ task_ids: [] })
+    expect(result).toContain("Error")
+    expect(result).toContain("non-empty")
+  })
+
+  test("TaskSteer — unknown task_id returns error", async () => {
+    const { TaskSteer } = getTaskTools()
+    const result = await TaskSteer.execute({ task_id: "nonexistent-id-xyz", message: "change approach" })
+    expect(result).toContain("Error")
+    expect(result).toContain("nonexistent-id-xyz")
+  })
+
+  test("TaskCancel — unknown task_id returns error", async () => {
+    const { TaskCancel } = getTaskTools()
+    const result = await TaskCancel.execute({ task_id: "nonexistent-id-abc", reason: "stop it" })
+    expect(result).toContain("Error")
+    expect(result).toContain("nonexistent-id-abc")
+  })
+
+  test("TaskSteer — injects message into steerQueue of running handle", async () => {
+    const { TaskSteer } = getTaskTools()
+    const handle: SubAgentHandle = {
+      id: "steer-test-id",
+      description: "steer test task",
+      promise: new Promise(() => {}), // never resolves
+      steerQueue: [],
+      cancelReason: null,
+      status: "running",
+    }
+    taskRegistry.set("steer-test-id", handle)
+
+    const result = await TaskSteer.execute({ task_id: "steer-test-id", message: "change approach" })
+    expect(result).toContain("Steer delivered")
+    expect(handle.steerQueue).toEqual(["change approach"])
+
+    // cleanup
+    taskRegistry.delete("steer-test-id")
+  })
+
+  test("TaskSteer — finished task returns 'already done' message", async () => {
+    const { TaskSteer } = getTaskTools()
+    const handle: SubAgentHandle = {
+      id: "steer-done-id",
+      description: "done task",
+      promise: Promise.resolve("done result"),
+      steerQueue: [],
+      cancelReason: null,
+      status: "done",
+    }
+    taskRegistry.set("steer-done-id", handle)
+
+    const result = await TaskSteer.execute({ task_id: "steer-done-id", message: "too late" })
+    expect(result).toContain("already")
+    expect(result).toContain("done")
+
+    taskRegistry.delete("steer-done-id")
+  })
+
+  test("TaskCancel — sets cancelReason on running handle", async () => {
+    const { TaskCancel } = getTaskTools()
+    const handle: SubAgentHandle = {
+      id: "cancel-test-id",
+      description: "cancel test task",
+      promise: new Promise(() => {}), // never resolves
+      steerQueue: [],
+      cancelReason: null,
+      status: "running",
+    }
+    taskRegistry.set("cancel-test-id", handle)
+
+    const result = await TaskCancel.execute({ task_id: "cancel-test-id", reason: "no longer needed" })
+    expect(result).toContain("Cancel delivered")
+    expect(handle.cancelReason).toBe("no longer needed")
+
+    taskRegistry.delete("cancel-test-id")
+  })
+
+  test("TaskCancel — already cancelled task returns appropriate message", async () => {
+    const { TaskCancel } = getTaskTools()
+    const handle: SubAgentHandle = {
+      id: "cancel-done-id",
+      description: "already cancelled task",
+      promise: Promise.resolve("cancelled result"),
+      steerQueue: [],
+      cancelReason: "original reason",
+      status: "cancelled",
+    }
+    taskRegistry.set("cancel-done-id", handle)
+
+    const result = await TaskCancel.execute({ task_id: "cancel-done-id", reason: "double cancel" })
+    expect(result).toContain("already")
+    expect(result).toContain("cancelled")
+
+    taskRegistry.delete("cancel-done-id")
+  })
+
+  test("TaskWait — resolves with result from registry handle", async () => {
+    const { TaskWait } = getTaskTools()
+    const handle: SubAgentHandle = {
+      id: "wait-test-id",
+      description: "wait test task",
+      promise: Promise.resolve("the answer is 42"),
+      steerQueue: [],
+      cancelReason: null,
+      status: "done",
+    }
+    taskRegistry.set("wait-test-id", handle)
+
+    const result = await TaskWait.execute({ task_ids: ["wait-test-id"] })
+    expect(result).toContain("the answer is 42")
+    expect(result).toContain("wait-test-id")
+
+    taskRegistry.delete("wait-test-id")
+  })
+
+  test("TaskWait — unknown task_id returns not found message", async () => {
+    const { TaskWait } = getTaskTools()
+    const result = await TaskWait.execute({ task_ids: ["completely-unknown-id"] })
+    expect(result).toContain("not found")
+  })
 })
