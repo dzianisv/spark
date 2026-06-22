@@ -2306,7 +2306,7 @@ async function main() {
         console.log(`${COLORS.dim}nothing to compact (${turns.length} turns)${COLORS.reset}`)
       } else {
         const after = estimateTokens(messages)
-        console.log(`↯ compacted: ${before} → ${after} est. tokens (kept system + last ${TAIL_TURNS} turns)`)
+        console.log(`♻️  ${COLORS.cyan}compacted${COLORS.reset} ${COLORS.dim}${before} → ${after} est. tokens (kept system + last ${TAIL_TURNS} turns)${COLORS.reset}`)
       }
       continue
     }
@@ -2544,15 +2544,26 @@ Start with PHASE 1 now.`
         if (estimateTokens(messages) > COMPACT_THRESHOLD) {
           const before = estimateTokens(messages)
           if (await compactMessages(currentModel, messages, turnAbort.signal))
-            console.log(`↯ auto-compacted: ${before} → ${estimateTokens(messages)} est. tokens`)
+            console.log(`\n♻️  ${COLORS.cyan}auto-compacted${COLORS.reset} ${COLORS.dim}${before} → ${estimateTokens(messages)} est. tokens (kept system + last ${TAIL_TURNS} turns)${COLORS.reset}`)
         }
 
         try {
           let thinkingStarted = false
           let contentStarted = false
 
+          // Show spinner while waiting for first token
+          process.stdout.write(`🤖 ${COLORS.dim}…${COLORS.reset}`)
+          let spinnerCleared = false
+          const clearSpinner = () => {
+            if (!spinnerCleared) {
+              process.stdout.write(`\r${COLORS.dim}   \r${COLORS.reset}`)
+              spinnerCleared = true
+            }
+          }
+
           const reply = await ollamaChat(currentModel, messages, toolDefsForCall, {
             onThinking(chunk) {
+              clearSpinner()
               if (!thinkingStarted) {
                 process.stdout.write(`🤖 ${COLORS.dim}`)
                 thinkingStarted = true
@@ -2560,6 +2571,7 @@ Start with PHASE 1 now.`
               process.stdout.write(chunk)
             },
             onContent(chunk) {
+              clearSpinner()
               if (thinkingStarted && !contentStarted) {
                 process.stdout.write(`${COLORS.reset}\n\n🤖 `)
               }
@@ -2571,9 +2583,23 @@ Start with PHASE 1 now.`
             },
           }, undefined, turnAbort.signal, thinkingEnabled)
 
+          clearSpinner()
+
           if (thinkingStarted && !contentStarted) process.stdout.write(`${COLORS.reset}`)
 
           if (turnAbort.signal.aborted) break
+
+          // Echo-suppression: some small models prefix their response by repeating
+          // the last user message verbatim. Strip it so it doesn't clutter the output.
+          if (reply.content && messages.length >= 2) {
+            const lastUserMsg = [...messages].reverse().find(m => m.role === "user")
+            if (lastUserMsg && typeof lastUserMsg.content === "string") {
+              const userText = lastUserMsg.content.trim()
+              if (reply.content.trimStart().startsWith(userText)) {
+                reply.content = reply.content.trimStart().slice(userText.length).trimStart()
+              }
+            }
+          }
 
           messages.push(reply)
 
