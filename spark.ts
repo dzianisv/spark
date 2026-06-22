@@ -959,50 +959,168 @@ function makeLoadSkill(skillMap: Map<string, string>): Tool {
 
 // ── Parallel Task Registry ────────────────────────────────────────────────────
 //
-// Design: background subagent system inspired by:
+// Research: how GitHub Copilot CLI, opencode, and Claude Code implement parallel
+// subagents and mid-run message passing — and how spark maps to each pattern.
 //
-// opencode (packages/opencode/src/tool/task.ts):
-//   - Task() creates a child Session with parentID, runs via ops.prompt() (awaited Effect fiber)
-//   - Returns task_id (session UUID) in result; parent can pass task_id to resume
-//   - Parallel: LLM emits multiple Task tool_calls in one turn → Effect forks them concurrently
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 1. GITHUB COPILOT CLI                                                       │
+// │    (the process running spark — /fleet /tasks /sidekicks /subagents)        │
+// └─────────────────────────────────────────────────────────────────────────────┘
 //
-// opencode (packages/opencode/src/tool/task-interrupt.ts):
-//   - task_steer: injects into Interrupt.Service (shared in-memory Map<sessionID,Pending>)
-//   - Child polls interrupt.consume(sessionID) at EVERY turn boundary
-//   - Steer formats as: <steer><reason>...</reason></steer> injected as a user message
-//   - Cancel formats as: <cancel><reason>...</reason></cancel>; child wraps up in CANCEL_GRACE_TURNS=2
-//   - task_abort: hard stop via Effect interrupt (no grace turns)
+// Spawn (non-blocking, background):
+//   task(name, prompt, agent_type, mode:"background")
+//   → returns agent_id immediately; agent runs concurrently on the JS event loop
+//   → agent_type selects a named specialist: "explore", "general-purpose",
+//     "rubber-duck", "code-review", "security-review", or custom agents under
+//     ~/.agents/ (e.g. "gsd-code-reviewer", "gsd-executor", "gsd-planner")
 //
-// opencode (packages/opencode/src/session/interrupt.ts):
-//   - Interrupt.request() writes to pending Map (cancel wins over steer if already queued)
-//   - Interrupt.consume() reads+deletes from pending; child calls this each turn
+// Await result:
+//   read_agent(agent_id, wait:true, timeout?)
+//   → blocks until the agent's current turn completes; returns full turn history
+//   → read_agent(agent_id, since_turn:N) for delta reads (only turns after N)
+//   → called automatically when the completion notification arrives
 //
-// CC (agents-supervisor/core/assessment.mjs):
-//   - No real-time steering; judge acts AFTER subagent completes
-//   - Parallelism: caller launches multiple subagent Promise chains simultaneously
+// Mid-run message injection (= task_steer equivalent):
+//   write_agent(agent_id, message)
+//   → delivers message as a new user turn to a running OR idle background agent
+//   → if agent is running: queued, delivered after the current turn completes
+//   → if agent is idle: wakes the agent to process the message as a new turn
+//   → supports full multi-turn back-and-forth: write → wait → write again
+//   → confirmed: used in this session for research refinement and follow-up
 //
-// GitHub Copilot CLI (this process — /fleet, /tasks, /sidekicks, /subagents commands):
-//   - task(name, prompt, agent_type, mode:"background") → spawn named subagent in background
-//   - write_agent(agent_id, message) → inject message mid-run at next turn boundary (= task_steer)
-//   - read_agent(agent_id, wait:true) → block until done, return result (= TaskWait)
-//   - list_agents() → enumerate running/completed agents
-//   - Automatic completion notification when background agent finishes (event-driven, no polling)
-//   - /fleet command → enables parallel subagent execution mode
-//   - Multiple background tasks run concurrently on the JS event loop (same as spark's model)
-//   - Agents are stateful across write_agent turns (multi-turn conversation in background)
+// List/enumerate:
+//   list_agents(include_completed?)
+//   → all active and completed background agents; status and agent_id
+//   → statuses: running, idle, completed, failed, cancelled
+//   → "(steerable)" = accepts write_agent; "(one-shot)" = read-only
 //
-// GitHub Copilot cloud agent (docs.github.com/en/copilot/concepts/agents/cloud-agent):
-//   - Runs in GitHub Actions ephemeral VM; task IS the session (one issue/PR = one Actions job)
-//   - Parallelism at session level only: assign multiple issues → each gets its own Actions job
-//   - Mid-run injection: human sends follow-up chat in the GitHub UI; not programmable by agent
-//   - Automations: trigger-based (schedule/issue-created/PR-opened); sequential within each run
+// Completion notification:
+//   → automatic event-driven notification when a background agent finishes
+//   → no polling needed; notification arrives as the next agent turn
+//   → pattern: launch → do independent work → wait for notification → read_agent
 //
-// spark model (this file):
-//   - Task() starts a background subagent loop, returns task_id immediately
-//   - TaskWait(task_ids) blocks until tasks complete, returns aggregated results
-//   - TaskSteer(task_id, message) injects at next turn boundary (polls steerQueue)
-//   - TaskCancel(task_id, reason) sets cancelled flag; subagent wraps up in ≤2 turns
-//   - Parallelism: parent calls Task() N times, then TaskWait([id1,id2,...]) → N agents run concurrently
+// Parallel pattern (used throughout this session):
+//   task(A, mode:"background") → id_A    // start agent A
+//   task(B, mode:"background") → id_B    // start agent B concurrently
+//   // do independent work while both run …
+//   read_agent(id_A, wait:true)           // collect A
+//   read_agent(id_B, wait:true)           // collect B
+//
+// /fleet  — enables parallel subagent execution mode (auto-fans out work)
+// /tasks  — view and manage running subagents and shell commands
+//
+// Agent statefulness:
+//   → agents retain full conversation history across write_agent turns
+//   → idle agents (done with last turn) re-engage on the next write_agent
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 2. OPENCODE                                                                  │
+// │    (packages/opencode/src/tool/task.ts + task-interrupt.ts + interrupt.ts)  │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+// Spawn:
+//   Task({ description, prompt, subagent_type, directory?, task_id? })
+//   → creates child Session with parentID; runs via ops.prompt() (Effect fiber)
+//   → returns task_id (session UUID) in the tool result string
+//   → task_id passed back to Task() resumes the prior session (stateful)
+//   → subagent_type: "general", "explore", "scout", or user-defined agents
+//
+// Parallel (session/prompt.ts:1561, workflow/index.ts:405):
+//   Effect.forEach(subtasks, handleSubtask, { concurrency: 16 })
+//   → up to 16 parallel Effect fibers per turn
+//   → workflow ctx.parallel(tasks, { concurrencyLimit? }) — worker pool via
+//     withConcurrency(): shared queue drained by Promise.all of N workers
+//
+// Mid-run injection — task_steer (task-interrupt.ts):
+//   task_steer({ task_id, reason })
+//   → Interrupt.request({ sessionID, intent:"steer", reason, origin:"parent" })
+//   → writes to pending Map<SessionID, Pending> (in-memory shared singleton)
+//   → cancel beats steer: if cancel already queued, steer is silently dropped
+//   → child calls Interrupt.consume(sessionID) at EVERY turn start
+//   → steer → injects renderSteer(reason) as user msg, then continues normally
+//   → renderSteer: <steer>\n<reason>…</reason>\n</steer>
+//
+// Graceful cancel — task_cancel:
+//   → Interrupt.request(intent:"cancel") → renderCancel injected
+//   → child gets CANCEL_GRACE_TURNS=2 turns to wrap up before forced stop
+//   → renderCancel: <cancel>\n<reason>…</reason>\n</cancel>
+//
+// Hard abort — task_abort:
+//   → Interrupt.abortChild() → Effect interrupt (no grace, immediate kill)
+//
+// Completion notification (session/status.ts):
+//   → session.idle Bus event fires when child transitions to idle status
+//   → plugin event handler: event.type === "session.idle" → runSupervisor()
+//   → waitForResponse() polling fallback: 2s interval, checks time.completed
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 3. CLAUDE CODE — agents-supervisor                                          │
+// │    (agents-supervisor/core/assessment.mjs, bin/on-stop.mjs)                │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+// Spawn:
+//   CC native Task() tool — creates a child context window for the subagent
+//   → no task_id / no resume; each Task call is a fresh context
+//   → subagent inherits core tools; Task itself excluded (no recursive spawning)
+//
+// Parallel:
+//   Caller launches multiple subagent Promise chains simultaneously (Promise.all)
+//   → no concurrency limit; all chains run on the JS event loop
+//   → supervisor itself is strictly sequential: activeSupervisors Set<string>
+//     ensures only one supervisor loop runs per session at a time
+//
+// Mid-run injection / completion:
+//   → Stop hook: CC calls bin/on-stop.mjs synchronously on EVERY agent stop
+//   → hook writes JSON to stdout:
+//       { decision:"block", reason:"<feedback>" }  → CC injects as user turn
+//       { decision:"proceed" }                     → agent allowed to stop
+//   → stop_hook_active guard prevents infinite hook loops
+//   → OpenCode variant: supervisor uses client.session.promptAsync() over HTTP
+//   → no real-time steering; supervisor only acts AFTER the agent stops
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 4. GITHUB COPILOT CLOUD AGENT                                               │
+// │    (docs.github.com/en/copilot/concepts/agents/cloud-agent)                │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+//   → Runs in GitHub Actions ephemeral VM; task IS the session (1 issue = 1 job)
+//   → No Task() tool; no in-session subagent spawning
+//   → Parallelism at session level only: multiple issues → multiple Actions jobs
+//   → Mid-run injection: human types in GitHub chat UI; not agent-programmable
+//   → Automations: trigger-based (cron / issue-opened / PR-opened); sequential
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 5. COMPARISON                                                               │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+//  Dimension        │ Copilot CLI          │ opencode             │ CC agents-sup     │ spark
+// ──────────────────┼──────────────────────┼──────────────────────┼───────────────────┼──────────────────
+//  Spawn API        │ task(agent_type,      │ Task({subagent_type, │ Task() native     │ Task({description,
+//                   │   mode:"background") │   task_id?,...})     │   (no resume)     │   prompt})
+//  Parallel         │ JS event loop;        │ Effect.forEach       │ Promise.all       │ Promise.all via
+//                   │   /fleet mode        │   concurrency:16     │   (no limit)      │   TaskWait
+//  Mid-run inject   │ write_agent(id, msg) │ task_steer →         │ Stop hook stdout  │ TaskSteer →
+//                   │   (running or idle)  │   Interrupt.Service  │   {block, reason} │   steerQueue
+//  Await result     │ read_agent(id,        │ ops.prompt() await   │ Promise.then      │ TaskWait([ids])
+//                   │   wait:true)         │   + session.idle evt │   inline          │   Promise.all
+//  Cancel           │ write_agent("stop…") │ task_cancel →        │ n/a (hook stops)  │ TaskCancel →
+//                   │                      │   CANCEL_GRACE=2     │                   │   cancelReason
+//  Notify           │ auto event-driven    │ session.idle Bus     │ CC calls hook     │ Promise resolve
+//  Resume session   │ write_agent wakes    │ task_id param        │ no                │ no
+//                   │   idle agent         │   reuses session     │                   │
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 6. SPARK IMPLEMENTATION CHOICES                                             │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+//   - Task() fires a background subagent Promise; returns task_id immediately
+//   - TaskWait([ids]) runs Promise.all → N agents run concurrently
+//   - TaskSteer(id, msg) pushes to steerQueue; consumed at each turn boundary
+//   - TaskCancel(id, reason) sets cancelReason; agent gets ≤CANCEL_GRACE_TURNS
+//   - Interrupt XML format (<steer>, <cancel>) mirrors opencode's interrupt.ts
+//   - CANCEL_GRACE_TURNS=2 matches opencode's constant exactly
+//   - No resume: local Ollama sessions are cheap; just spawn a fresh Task
+//   - No Effect fibers or Bus events: JS Promise + Map is sufficient for Ollama
 
 export interface SubAgentHandle {
   id: string
