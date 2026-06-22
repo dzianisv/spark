@@ -1128,6 +1128,22 @@ async function clearGoal(): Promise<void> {
   } catch {}
 }
 
+const AUTOPILOT_COUNT_FILE = join(".agents", "spark", "autopilot-count")
+
+async function loadAutopilotCount(): Promise<number> {
+  try {
+    return parseInt(await readFile(AUTOPILOT_COUNT_FILE, "utf-8"), 10) || 0
+  } catch {
+    return 0
+  }
+}
+
+async function saveAutopilotCount(n: number): Promise<void> {
+  const dir = dirname(AUTOPILOT_COUNT_FILE)
+  await mkdir(dir, { recursive: true }).catch(() => {})
+  await writeFile(AUTOPILOT_COUNT_FILE, String(n), "utf-8")
+}
+
 async function selectModel(models: string[], current: string, rl: ReturnType<typeof createInterface>): Promise<string> {
   console.log(`\n${COLORS.cyan}Available models:${COLORS.reset}`)
   models.forEach((m, i) => {
@@ -1152,7 +1168,51 @@ async function selectModel(models: string[], current: string, rl: ReturnType<typ
 
 // ── Goal Supervisor ──────────────────────────────────────────────────────────
 
-export interface GoalVerdict { reached: boolean; feedback: string }
+/**
+ * Injects the active goal into the system prompt as a MANDATORY completion
+ * requirement with an evidence rule — mirrors Claude Code's agents-supervisor
+ * buildGoalRequirementSection(). A bare "I'm done" claim without tool output
+ * evidence does NOT satisfy this block.
+ */
+export function buildGoalBlock(goal: string): string {
+  if (!goal.trim()) return ""
+  return `
+
+## GOAL (mandatory completion requirement)
+
+MANDATORY: The following goal MUST be demonstrably met before the task is complete:
+
+  "${goal.trim()}"
+
+Evidence rule: a claim that this goal is met MUST be backed by evidence already
+in the conversation — commands run and their output, tests executed, files created
+and verified. A bare assertion does NOT count as evidence. If you believe the goal
+is met, show the proof (command output, file contents, test results).`
+}
+
+/**
+ * Builds an escalating supervisor feedback message based on how many checks
+ * have already fired. Escalation levels mirror CC's buildEscalatingFeedback():
+ *   checks 1-2: gentle nudge
+ *   checks 3-4: firmer, asks for plan change
+ *   checks 5-9: strong — detect planning loop, demand action
+ *   checks 10+: final warning, ask for different approach
+ */
+export function buildSupervisorFeedback(checkCount: number, goal: string, feedback: string): string {
+  const base = feedback ? `${feedback} ` : ""
+  if (checkCount <= 2) {
+    return `[supervisor] Goal not yet reached. ${base}Keep working toward the goal: ${goal}`
+  }
+  if (checkCount <= 4) {
+    return `[supervisor] Still not reached after ${checkCount} checks. ${base}If you have been only reading files, start writing. Make a concrete change now. Goal: ${goal}`
+  }
+  if (checkCount <= 9) {
+    return `[supervisor] STOP PLANNING — ${checkCount} checks have fired with no completion. ${base}Do NOT read more files. Pick one concrete action and execute it immediately. Goal: ${goal}`
+  }
+  return `[supervisor] WARNING: ${checkCount} supervisor cycles without completion. ${base}You must either complete the goal NOW or call autopilot_exit and explain why it cannot be done. Goal: ${goal}`
+}
+
+
 
 const VERDICT_SCHEMA = {
   type: "object",
@@ -1172,14 +1232,51 @@ export function parseVerdict(text: string): GoalVerdict {
   }
 }
 
+export async function deriveGoal(
+  model: string,
+  messages: Message[],
+  existingGoal: string | null,
+  signal?: AbortSignal,
+): Promise<string> {
+  const userTurns = messages
+    .filter(m => m.role === "user" && typeof m.content === "string")
+    .filter(m => !String(m.content).startsWith("[supervisor]") && !String(m.content).startsWith("[autopilot]"))
+    .slice(-6)
+    .map(m => String(m.content).slice(0, 400))
+    .join("\n---\n")
+
+  const systemPrompt =
+    "You are a goal synthesizer for an AI coding agent. " +
+    "Produce a single precise, measurable, actionable goal in one sentence. " +
+    "Describe exactly what 'done' looks like. " +
+    "Reply with ONLY the goal text — no explanation, no preamble, no quotes."
+
+  const userPrompt = existingGoal
+    ? `Stated goal: ${existingGoal}\n\n${userTurns ? `Recent conversation:\n${userTurns}\n\n` : ""}Refine into a single precise, verifiable goal. What exactly does success look like?`
+    : `Conversation:\n${userTurns || "(no prior messages)"}\n\nWhat is the single most important goal to accomplish? State it precisely.`
+
+  const reply = await ollamaChat(
+    model,
+    [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+    [], undefined, undefined, signal,
+  )
+
+  const derived = (reply.content ?? "").trim().slice(0, 300)
+  return derived || existingGoal || "Complete the current task"
+}
+
 export async function checkGoal(model: string, goal: string, messages: Message[], signal?: AbortSignal): Promise<GoalVerdict> {
   const lastAssistant = [...messages].reverse().find(m => m.role === "assistant")?.content ?? ""
-  const tail = messages.slice(-6).map(m => {
-    const c = typeof m.content === "string" ? m.content.slice(0, 300) : ""
-    return `${m.role}: ${c}`
-  }).join("\n")
+  // Skip injected [supervisor] / [autopilot] messages when finding the last real user message —
+  // these contain "Goal not yet reached" which confuses the judge into a false negative.
+  const lastUser = [...messages].reverse().find(
+    m => m.role === "user" &&
+    typeof m.content === "string" &&
+    !m.content.startsWith("[supervisor]") &&
+    !m.content.startsWith("[autopilot]")
+  )?.content ?? ""
   const judgeSystem = "You are a strict goal supervisor for a coding agent. You judge whether a GOAL is fully accomplished based on the conversation. Be skeptical of unverified claims."
-  const judgeUser = `GOAL: ${goal}\n\nThe agent's final message:\n${lastAssistant}\n\nRecent transcript:\n${tail}\n\nIs the GOAL fully reached? Respond with ONLY a JSON object: {"reached": true|false, "feedback": "<if not reached, one concrete next action to push the agent forward; empty string if reached>"}`
+  const judgeUser = `GOAL: ${goal}\n\nLast user message:\n${typeof lastUser === "string" ? lastUser : ""}\n\nAgent's last message:\n${typeof lastAssistant === "string" ? lastAssistant : ""}\n\nIs the GOAL fully reached? Respond with ONLY a JSON object: {"reached": true|false, "feedback": "<if not reached, one concrete next action to push the agent forward; empty string if reached>"}`
   const reply = await ollamaChat(model, [
     { role: "system", content: judgeSystem },
     { role: "user", content: judgeUser },
@@ -1282,7 +1379,7 @@ async function main() {
   const messages: Message[] = [{ role: "system", content: systemPrompt }]
   let goal: string | null = await loadGoal()
   if (goal) {
-    messages[0].content += `\n\nCurrent goal: ${goal}`
+    messages[0].content += buildGoalBlock(goal)
   }
   let autopilot = false
 
@@ -1409,12 +1506,17 @@ async function main() {
       if (arg === "clear") {
         goal = null
         await clearGoal()
+        // Also strip the MANDATORY goal block from system prompt if present
+        messages[0].content = messages[0].content.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
         console.log(`goal cleared`)
       } else {
         goal = arg
         await saveGoal(arg)
         console.log(`goal set: ${arg}`)
-        messages.push({ role: "user", content: `My current goal: ${arg}` })
+        // Update system prompt with MANDATORY block, replace any existing one
+        messages[0].content = messages[0].content.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
+        messages[0].content += buildGoalBlock(arg)
+        messages.push({ role: "user", content: `My current goal: ${arg}\n\nThis goal is mandatory — I need you to work toward it and provide evidence when it is achieved.` })
       }
       continue
     }
@@ -1461,9 +1563,35 @@ async function main() {
         continue
       }
       autopilot = true
-      console.log(`autopilot ON — running autonomously until autopilot_exit or ${MAX_AUTOPILOT_REFLECTIONS} reflections`)
-      messages.push({ role: "user", content: arg })
       skipGenericPush = true
+
+      // Include any inline task arg as staging context for goal derivation,
+      // but don't push it as a raw message — the kick-off message below replaces it.
+      const stagingMessages: Message[] = arg && arg !== "on"
+        ? [...messages, { role: "user", content: arg }]
+        : messages
+
+      process.stdout.write(`${COLORS.dim}deriving goal…${COLORS.reset}\r`)
+      const derived = await deriveGoal(currentModel, stagingMessages, goal)
+      goal = derived
+      await saveGoal(derived)
+
+      // Inject MANDATORY goal block into system prompt
+      messages[0].content = messages[0].content.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
+      messages[0].content += buildGoalBlock(derived)
+
+      const objectiveN = (await loadAutopilotCount()) + 1
+      await saveAutopilotCount(objectiveN)
+
+      const preview = derived.length > 80 ? derived.slice(0, 80) + "…" : derived
+      process.stdout.write("                              \r")
+      console.log(`copilot: ${COLORS.green}●${COLORS.reset} Started autopilot objective #${objectiveN}: ${preview}`)
+
+      // Kick-off message anchors the agent to the refined goal from turn 1
+      messages.push({
+        role: "user",
+        content: `[autopilot] Objective #${objectiveN}: ${derived}\nWork toward this goal autonomously. Use tools. Provide evidence (command output, file contents, test results) when done. Call autopilot_exit only when the goal is fully achieved and verified.`,
+      })
       // fall through into the agent loop below by NOT continuing
     }
 
@@ -1501,7 +1629,6 @@ async function main() {
     const toolDefsForCall = tools.map((t) => t.definition)
     const toolMap = new Map(tools.map((t) => [t.definition.function.name, t]))
     const MAX_TOOL_ROUNDS = autopilot ? 200 : 30
-    const MAX_GOAL_CHECKS = 10
     let goalChecks = 0
 
     // Per-turn abort controller — Esc/Ctrl+C aborts and returns to prompt; Ctrl+Q exits
@@ -1635,10 +1762,6 @@ async function main() {
       }
 
       if (!goal) break supervise
-      if (goalChecks >= MAX_GOAL_CHECKS) {
-        console.log(`⚠ supervisor: goal not reached after ${MAX_GOAL_CHECKS} checks — stopping`)
-        break supervise
-      }
       goalChecks++
       let verdict: GoalVerdict
       try {
@@ -1649,8 +1772,12 @@ async function main() {
       }
       if (turnAbort.signal.aborted) break supervise
       if (verdict.reached) { console.log(`✓ supervisor: goal reached`); break supervise }
-      console.log(`↻ supervisor (${goalChecks}/${MAX_GOAL_CHECKS}): ${verdict.feedback}`)
-      messages.push({ role: "user", content: `[supervisor] Goal not yet reached. ${verdict.feedback} Keep working toward the goal: ${goal}` })
+      // Soft milestone warnings
+      if (goalChecks === 5)  console.log(`${COLORS.yellow}⚠ supervisor: 5 checks — consider rephrasing goal or changing approach${COLORS.reset}`)
+      if (goalChecks === 10) console.log(`${COLORS.yellow}⚠ supervisor: 10 checks — if stuck, interrupt with Esc${COLORS.reset}`)
+      const nudge = buildSupervisorFeedback(goalChecks, goal, verdict.feedback)
+      console.log(`↻ supervisor (check ${goalChecks}): ${verdict.feedback}`)
+      messages.push({ role: "user", content: nudge })
     }
 
     process.off("SIGINT", sigintHandler)

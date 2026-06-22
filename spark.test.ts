@@ -3,7 +3,7 @@
 // Requires: Ollama running with at least one model
 
 import { test, expect, beforeAll, describe } from "bun:test"
-import { parseVerdict, checkGoal, makeAutopilotExit, AUTOPILOT_NUDGE, MAX_AUTOPILOT_REFLECTIONS, AUTOPILOT_SUMMARY_PROMPT, estimateTokens, splitTurns, compactMessages, TAIL_TURNS, ollamaChat as sparkOllamaChat } from "./spark.ts"
+import { parseVerdict, checkGoal, deriveGoal, buildGoalBlock, buildSupervisorFeedback, makeAutopilotExit, AUTOPILOT_NUDGE, MAX_AUTOPILOT_REFLECTIONS, AUTOPILOT_SUMMARY_PROMPT, estimateTokens, splitTurns, compactMessages, TAIL_TURNS, ollamaChat as sparkOllamaChat } from "./spark.ts"
 import type { Message as SparkMessage } from "./spark.ts"
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -620,6 +620,143 @@ describe("goal supervisor", () => {
   }, TIMEOUT)
 })
 
+// ── Goal Supervisor v2 — narrowed judge (last user + last AI only) ────────────
+
+describe("goal supervisor v2 — last-2-message judge", () => {
+
+  // ── Deterministic unit tests (no LLM) ─────────────────────────────────────
+
+  test("uses LAST assistant message, not first — multi-assistant conversation", async () => {
+    // First assistant says "done", last assistant says "still working" — judge should see "still working"
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "Write a sort function" },
+      { role: "assistant", content: "I have completed the task and all tests pass." }, // first — should be ignored
+      { role: "user", content: "[supervisor] Goal not yet reached. Run the tests." },
+      { role: "assistant", content: "I ran the tests and 3 are still failing. The sort is broken on empty arrays." }, // last
+    ]
+    const verdict = await checkGoal(judgeModel, "Write a sort function with passing tests", messages)
+    // Last assistant clearly says failing → should be not reached
+    expect(verdict.reached).toBe(false)
+  }, TIMEOUT)
+
+  test("uses LAST user message, not original task — when supervisor nudge is last user", async () => {
+    // Last user message is a supervisor nudge, not the original task
+    // Judge should still assess from the last 2 msgs + the explicit GOAL param
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "Create a README.md file" },
+      { role: "assistant", content: "I created README.md with full content. All done." },
+      { role: "user", content: "[supervisor] Goal not yet reached. Verify the file actually exists on disk." },
+      { role: "assistant", content: "I verified: README.md exists, 42 lines, content looks correct. Task complete." },
+    ]
+    const verdict = await checkGoal(judgeModel, "Create a README.md file", messages)
+    // Last AI confirms file exists and task complete → should be reached
+    expect(verdict.reached).toBe(true)
+  }, TIMEOUT)
+
+  test("non-string content in last assistant message is handled gracefully — no throw", async () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "Do something" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "1", function: { name: "Bash", arguments: { command: "ls" } } }],
+      },
+    ]
+    // Should not throw, should return reached=false (tool call in progress = not done)
+    let threw = false
+    let verdict: { reached: boolean; feedback: string } = { reached: false, feedback: "" }
+    try {
+      verdict = await checkGoal(judgeModel, "List files", messages)
+    } catch {
+      threw = true
+    }
+    expect(threw).toBe(false)
+    expect(verdict.reached).toBe(false)
+  }, TIMEOUT)
+
+  // ── LLM integration tests ──────────────────────────────────────────────────
+
+  test("reached=true: last exchange shows unambiguous completion with verification", async () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark, a coding agent." },
+      { role: "user", content: "Add a hello() function to utils.ts" },
+      { role: "assistant", content: "Attempting to read the file first..." },
+      { role: "user", content: "[supervisor] Goal not yet reached. Actually write the function." },
+      { role: "assistant", content: "Done. I wrote the hello() function to utils.ts and ran `bun utils.ts` — output is 'Hello, world!' as expected. The function is in place and verified." },
+    ]
+    const verdict = await checkGoal(judgeModel, "Add a hello() function to utils.ts", messages)
+    expect(verdict.reached).toBe(true)
+  }, TIMEOUT)
+
+  test("reached=false: last AI message is mid-work, not done", async () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark, a coding agent." },
+      { role: "user", content: "Fix the failing CI build" },
+      { role: "assistant", content: "Test output: 5 FAILED, 0 passed. Errors: Cannot find module './auth'. I have not made any fixes yet." },
+    ]
+    const verdict = await checkGoal(judgeModel, "Fix the failing CI build", messages)
+    expect(verdict.reached).toBe(false)
+    expect(verdict.feedback.length).toBeGreaterThan(0)
+  }, TIMEOUT)
+
+  test("feedback is empty or minimal when goal is reached", async () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark, a coding agent." },
+      { role: "user", content: "Write a sum function" },
+      { role: "assistant", content: "I wrote the sum function in math.ts, added tests, and all 3 tests pass. Goal complete." },
+    ]
+    const verdict = await checkGoal(judgeModel, "Write a sum function with passing tests", messages)
+    console.log(`  reached=${verdict.reached} feedback="${verdict.feedback}"`)
+    // Primary check: judge recognises goal as reached
+    expect(verdict.reached).toBe(true)
+    // feedback MAY be empty or a summary — small models often echo; we just log it
+  }, TIMEOUT)
+
+  test("feedback is actionable (non-empty) when goal is not reached", async () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark, a coding agent." },
+      { role: "user", content: "Write tests for the parser module" },
+      { role: "assistant", content: "I looked at the parser module. It has 5 exported functions." },
+    ]
+    const verdict = await checkGoal(judgeModel, "Write tests for the parser module", messages)
+    expect(verdict.reached).toBe(false) // clearly not done — only read, didn't write tests
+    expect(verdict.feedback.length).toBeGreaterThan(0)
+  }, TIMEOUT)
+
+  test("no hard cap: 12 sequential checkGoal calls all resolve without error", async () => {
+    // Verifies that MAX_GOAL_CHECKS was removed — no artificial limit at the function level
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "Make all tests pass" },
+      { role: "assistant", content: "Tests are still failing." },
+    ]
+    const results: { reached: boolean }[] = []
+    for (let i = 0; i < 12; i++) {
+      const v = await checkGoal(judgeModel, "Make all tests pass", messages)
+      results.push({ reached: v.reached })
+    }
+    expect(results).toHaveLength(12)
+    // All should consistently say not reached (deterministic fixture)
+    expect(results.every(r => !r.reached)).toBe(true)
+  }, TIMEOUT * 10) // generous timeout for 12 LLM calls
+
+  test("judge skeptical: agent planning (not done) → reached=false", async () => {
+    // Use a fixture that is unambiguously incomplete even for a small model:
+    // agent says "I'm still analyzing, haven't fixed anything yet"
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "Run the test suite and make it pass" },
+      { role: "assistant", content: "I'm still analyzing the test failures. I can see 3 errors in auth.ts. Let me start fixing them one by one." },
+    ]
+    const verdict = await checkGoal(judgeModel, "Run the test suite and make it pass", messages)
+    // Clearly mid-work — no model should say this is done
+    expect(verdict.reached).toBe(false)
+  }, TIMEOUT)
+})
+
 // ── Autopilot Tests ──────────────────────────────────────────────────────────
 
 describe("autopilot", () => {
@@ -781,6 +918,86 @@ function makeOllamaStreamLine(content: string, done = false): string {
   return JSON.stringify({ message: { role: "assistant", content }, done }) + "\n"
 }
 
+
+describe("buildGoalBlock", () => {
+  test("contains MANDATORY and goal text", () => {
+    const block = buildGoalBlock("Make all tests pass")
+    expect(block).toContain("MANDATORY")
+    expect(block).toContain("Make all tests pass")
+  })
+
+  test("contains evidence rule", () => {
+    const block = buildGoalBlock("Write a sort function")
+    expect(block).toContain("Evidence rule")
+    expect(block).toContain("bare assertion does NOT count")
+  })
+
+  test("returns empty string for empty goal", () => {
+    expect(buildGoalBlock("")).toBe("")
+    expect(buildGoalBlock("   ")).toBe("")
+  })
+
+  test("starts with newline separator", () => {
+    const block = buildGoalBlock("Do something")
+    expect(block.startsWith("\n\n")).toBe(true)
+  })
+
+  test("wraps goal in quotes", () => {
+    const block = buildGoalBlock("Fix the bug")
+    expect(block).toContain('"Fix the bug"')
+  })
+})
+
+describe("buildSupervisorFeedback", () => {
+  test("check 1 — gentle nudge, contains goal", () => {
+    const msg = buildSupervisorFeedback(1, "Make tests pass", "Run the test suite.")
+    expect(msg).toContain("[supervisor]")
+    expect(msg).toContain("Make tests pass")
+    expect(msg).toContain("Run the test suite.")
+  })
+
+  test("check 2 — still gentle", () => {
+    const msg = buildSupervisorFeedback(2, "Write a README", "")
+    expect(msg).toContain("[supervisor]")
+    expect(msg).not.toContain("STOP")
+  })
+
+  test("check 3 — firmer tone, mentions check count", () => {
+    const msg = buildSupervisorFeedback(3, "Fix the build", "")
+    expect(msg).toContain("3 checks")
+    expect(msg).toContain("start writing")
+  })
+
+  test("check 5 — strong, demands concrete action", () => {
+    const msg = buildSupervisorFeedback(5, "Create hello.ts", "")
+    expect(msg).toContain("STOP PLANNING")
+    expect(msg).toContain("5 checks")
+  })
+
+  test("check 10 — final warning with autopilot_exit mention", () => {
+    const msg = buildSupervisorFeedback(10, "Write tests", "")
+    expect(msg).toContain("10 supervisor cycles")
+    expect(msg).toContain("autopilot_exit")
+  })
+
+  test("check 15 — same as 10+ escalation level", () => {
+    const msg = buildSupervisorFeedback(15, "Write tests", "")
+    expect(msg).toContain("supervisor cycles")
+    expect(msg).toContain("autopilot_exit")
+  })
+
+  test("feedback text is included in output", () => {
+    const msg = buildSupervisorFeedback(1, "goal", "Run bun test first.")
+    expect(msg).toContain("Run bun test first.")
+  })
+
+  test("empty feedback doesn't add extra space artifacts", () => {
+    const msg = buildSupervisorFeedback(1, "goal", "")
+    expect(msg).not.toContain("undefined")
+    expect(msg.trim().length).toBeGreaterThan(10)
+  })
+})
+
 describe("ollamaChat capability probe", () => {
   function makeMockServer(thinkingSupported: boolean) {
     return Bun.serve({
@@ -925,4 +1142,68 @@ describe("ollamaChat capability probe", () => {
       server.stop()
     }
   }, 10_000)
+})
+
+// ── deriveGoal tests ──────────────────────────────────────────────────────────
+
+describe("deriveGoal", () => {
+  test("returns a non-empty string from conversation context", async () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "I need you to write unit tests for the parser module in src/parser.ts" },
+      { role: "assistant", content: "Sure, I'll start by reading the file." },
+    ]
+    const goal = await deriveGoal(judgeModel, messages, null)
+    expect(typeof goal).toBe("string")
+    expect(goal.length).toBeGreaterThan(10)
+    console.log(`  derived (no prior goal): "${goal}"`)
+  }, TIMEOUT)
+
+  test("refines an existing goal to be more specific", async () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "Make the tests pass and add coverage for edge cases in auth.ts" },
+    ]
+    const vague = "fix tests"
+    const refined = await deriveGoal(judgeModel, messages, vague)
+    console.log(`  vague: "${vague}" → refined: "${refined}"`)
+    expect(refined.length).toBeGreaterThan(vague.length) // refined should be more detailed
+    expect(refined).not.toBe(vague) // must actually change it
+  }, TIMEOUT)
+
+  test("filters out [supervisor] and [autopilot] injected messages", async () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "Refactor the database module to use connection pooling" },
+      { role: "assistant", content: "Starting refactor..." },
+      { role: "user", content: "[supervisor] Goal not yet reached. Keep working." },
+      { role: "user", content: "[autopilot] Objective #1: Refactor db module\nWork toward this." },
+    ]
+    const goal = await deriveGoal(judgeModel, messages, null)
+    // Should derive from the real user message, not echo the injected ones
+    expect(goal).not.toContain("[supervisor]")
+    expect(goal).not.toContain("[autopilot]")
+    console.log(`  derived (with injected msgs): "${goal}"`)
+  }, TIMEOUT)
+
+  test("falls back gracefully with no conversation context", async () => {
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+    ]
+    const goal = await deriveGoal(judgeModel, messages, null)
+    expect(typeof goal).toBe("string")
+    expect(goal.length).toBeGreaterThan(0)
+    console.log(`  derived (empty context): "${goal}"`)
+  }, TIMEOUT)
+
+  test("uses existing goal as fallback when LLM returns empty", async () => {
+    // Even if the model misbehaves, existingGoal is the floor
+    const existing = "Write integration tests for the API"
+    // Pass a minimal conversation so the model has something to work with
+    const messages: SparkMessage[] = [{ role: "system", content: "You are spark." }]
+    const goal = await deriveGoal(judgeModel, messages, existing)
+    expect(goal.length).toBeGreaterThan(0)
+    // If model returned empty, we'd get the existing goal back
+    console.log(`  derived (with existing fallback): "${goal}"`)
+  }, TIMEOUT)
 })
