@@ -374,10 +374,12 @@ async function judgeSubagent(
   const prompt = `You are a code quality judge (sub-agent) evaluating recent changes to spark.ts goal supervision.
 
 ## Changes evaluated
-1. \`checkGoal()\`: narrowed context from "last 6 msgs × 300 chars" → "last user msg + last AI msg only"
-2. Removed MAX_GOAL_CHECKS=10 cap (supervisor runs until done or interrupted)
-3. Added \`deriveGoal()\`: LLM derives/refines goal when /autopilot starts
-4. /autopilot prints: "copilot: ● Started autopilot objective #N: <preview>"
+1. \`checkGoal()\`: narrowed context from "last 6 msgs × 300 chars" → "last real user msg + last AI msg only"; skips [supervisor]/[autopilot]/[System:] injected messages
+2. \`buildGoalBlock()\`: goal now injected as MANDATORY block with evidence rule (agent must paste output in reply); replaces old plain-text "Current goal: …" append
+3. \`buildSupervisorFeedback()\`: escalating nudge by check count (gentle 1-2 → STOP PLANNING 5-9 → WARNING 10+)
+4. Bounded check cap split by mode: interactive=5 checks, autopilot=50 checks (was a hard 10 cap for both)
+5. \`deriveGoal()\`: LLM derives/refines goal when /autopilot starts; filters injected messages
+6. /autopilot prints: "copilot: ● Started autopilot objective #N: <preview>"
 
 ## Before/after fixture comparison (${FIXTURES.length} cases)
 Before score: ${bpassCount}/${FIXTURES.length} correct
@@ -385,11 +387,11 @@ After score:  ${apassCount}/${FIXTURES.length} correct
 
 ${table}
 
-## Automated test suite (goal supervisor + deriveGoal tests)
+## Automated test suite (goal supervisor + deriveGoal + buildGoalBlock + buildSupervisorFeedback tests)
 ${testRunOutput.slice(-2000)}
 
 ## Score 1-10
-Consider: correctness improvement, design soundness, risk of removing the cap, test coverage quality.
+Consider: correctness improvement (fixture scores), design soundness (MANDATORY block vs plain text, escalating nudge), check cap split rationale (5 interactive vs 50 autopilot), test coverage quality.
 
 Respond with ONLY valid JSON:
 {"score": <1-10>, "feedback": "<2-3 sentences of concrete feedback on what improved, what risks remain, what to test next>"}`
