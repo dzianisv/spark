@@ -981,9 +981,14 @@ function makeLoadSkill(skillMap: Map<string, string>): Tool {
 //   - No real-time steering; judge acts AFTER subagent completes
 //   - Parallelism: caller launches multiple subagent Promise chains simultaneously
 //
-// GitHub Copilot:
-//   - No real-time steering or mid-run injection
-//   - Task IS the session; each Copilot CLI invocation is one agent
+// GitHub Copilot cloud agent (docs.github.com/en/copilot/concepts/agents/cloud-agent):
+//   - Runs in GitHub Actions ephemeral VM; task IS the session (one issue/PR = one Actions job)
+//   - No Task() tool; no programmatic subagent spawning within a session
+//   - Parallelism: assign multiple issues simultaneously → each gets its own isolated session
+//   - Mid-run injection: human sends follow-up chat messages via the GitHub UI; no API hook
+//   - Steering is user-driven only (chat prompt: "steer the session"); not programmable
+//   - Copilot CLI binary (Node SEA): no task_steer, subagent, or task_id strings — confirmed
+//   - Automations: trigger-based (schedule/issue-created/PR-opened); sequential within each run
 //
 // spark model (this file):
 //   - Task() starts a background subagent loop, returns task_id immediately
