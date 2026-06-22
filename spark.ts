@@ -1160,6 +1160,7 @@ export function makeTaskTools(
   model: string,
   systemPrompt: string,
   tools: Tool[],
+  chatFn: typeof ollamaChat = ollamaChat,  // injectable for deterministic tests
 ): Tool[] {
   // Sub-agent tools: everything EXCEPT Task-family (no recursive spawning)
   const taskNames = new Set(["Task", "TaskWait", "TaskSteer", "TaskCancel"])
@@ -1195,7 +1196,7 @@ export function makeTaskTools(
           if (steer) subMessages.push({ role: "user", content: renderSteer(steer) })
         }
 
-        const reply = await ollamaChat(model, subMessages, toolDefs, undefined, undefined, handle.abort.signal)
+        const reply = await chatFn(model, subMessages, toolDefs, undefined, undefined, handle.abort.signal)
         subMessages.push(reply)
         lastContent = reply.content
 
@@ -1217,6 +1218,16 @@ export function makeTaskTools(
         }
       }
     } catch (err: unknown) {
+      // The only caller of handle.abort.abort() is the timeout handler, which also
+      // sets handle.cancelReason. Once the shared AbortController trips, every
+      // subsequent chatFn call throws immediately, so the grace-turn / cancel
+      // injection path can never run after a timeout. Report it as a graceful
+      // "cancelled" with the timeout reason rather than a generic failure with a
+      // cryptic AbortError string.
+      if (handle.abort.signal.aborted) {
+        if (handle.status === "running") handle.status = "cancelled"
+        return truncateOutput(handle.cancelReason ?? lastContent)
+      }
       const msg = err instanceof Error ? err.message : String(err)
       if (handle.status === "running") handle.status = "failed"
       return `Error: ${msg}`
@@ -1265,7 +1276,9 @@ export function makeTaskTools(
         abort: new AbortController(),
       }
 
-      // Timeout: abort the in-flight ollamaChat and inject cancel message
+      // Timeout: abort the in-flight chatFn. Aborting the shared controller makes
+      // every subsequent chatFn call throw, so the agent stops immediately; the
+      // catch in runSubAgent reports it as "cancelled" using cancelReason.
       const timeoutId = setTimeout(() => {
         if (handle.status === "running") {
           handle.cancelReason = `Timed out after ${timeout}ms`
@@ -1273,7 +1286,7 @@ export function makeTaskTools(
         }
       }, timeout)
 
-      process.stderr.write(`\x1b[90m[Task: ${desc}] started (id: ${id})\x1b[0m\n`)
+      process.stderr.write(`\x1b[90m🔧 [Task: ${desc}] started (id: ${id})\x1b[0m\n`)
       handle.promise = runSubAgent(handle, prompt).finally(() => clearTimeout(timeoutId))
       taskRegistry.set(id, handle)
 
@@ -2143,7 +2156,7 @@ async function main() {
 
   const prompt = () =>
     new Promise<string>((res) => {
-      rl.question(`${COLORS.green}> ${COLORS.reset}`, res)
+      rl.question(`👤 ${COLORS.green}> ${COLORS.reset}`, res)
     })
 
   // Collect input: bare Enter submits; trailing \ continues; bracketed pastes
@@ -2158,7 +2171,7 @@ async function main() {
       const isCommand = lines.length === 0 && line.trimStart().startsWith("/")
       if (!isPaste && !isCommand && raw.endsWith("\\")) {
         lines.push(raw.slice(0, -1))
-        process.stdout.write(`${COLORS.green}... ${COLORS.reset}`)
+        process.stdout.write(`👤 ${COLORS.green}... ${COLORS.reset}`)
       } else {
         lines.push(line)
         return lines.join("\n")
@@ -2541,16 +2554,19 @@ Start with PHASE 1 now.`
           const reply = await ollamaChat(currentModel, messages, toolDefsForCall, {
             onThinking(chunk) {
               if (!thinkingStarted) {
-                process.stdout.write(`${COLORS.dim}`)
+                process.stdout.write(`🤖 ${COLORS.dim}`)
                 thinkingStarted = true
               }
               process.stdout.write(chunk)
             },
             onContent(chunk) {
               if (thinkingStarted && !contentStarted) {
-                process.stdout.write(`${COLORS.reset}\n\n`)
+                process.stdout.write(`${COLORS.reset}\n\n🤖 `)
               }
-              if (!contentStarted) contentStarted = true
+              if (!contentStarted) {
+                if (!thinkingStarted) process.stdout.write(`🤖 `)
+                contentStarted = true
+              }
               process.stdout.write(chunk)
             },
           }, undefined, turnAbort.signal, thinkingEnabled)
@@ -2584,7 +2600,7 @@ Start with PHASE 1 now.`
             const toolArgs = call.function.arguments
             const tool = toolMap.get(toolName)
 
-            console.log(`${COLORS.magenta}[${toolName}]${COLORS.reset} ${COLORS.dim}${formatToolArgs(toolArgs)}${COLORS.reset}`)
+            console.log(`🔧 ${COLORS.magenta}[${toolName}]${COLORS.reset} ${COLORS.dim}${formatToolArgs(toolArgs)}${COLORS.reset}`)
 
             let result: string
             if (!tool) {
