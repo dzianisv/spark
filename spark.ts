@@ -981,13 +981,20 @@ function makeLoadSkill(skillMap: Map<string, string>): Tool {
 //   - No real-time steering; judge acts AFTER subagent completes
 //   - Parallelism: caller launches multiple subagent Promise chains simultaneously
 //
+// GitHub Copilot CLI (this process — /fleet, /tasks, /sidekicks, /subagents commands):
+//   - task(name, prompt, agent_type, mode:"background") → spawn named subagent in background
+//   - write_agent(agent_id, message) → inject message mid-run at next turn boundary (= task_steer)
+//   - read_agent(agent_id, wait:true) → block until done, return result (= TaskWait)
+//   - list_agents() → enumerate running/completed agents
+//   - Automatic completion notification when background agent finishes (event-driven, no polling)
+//   - /fleet command → enables parallel subagent execution mode
+//   - Multiple background tasks run concurrently on the JS event loop (same as spark's model)
+//   - Agents are stateful across write_agent turns (multi-turn conversation in background)
+//
 // GitHub Copilot cloud agent (docs.github.com/en/copilot/concepts/agents/cloud-agent):
 //   - Runs in GitHub Actions ephemeral VM; task IS the session (one issue/PR = one Actions job)
-//   - No Task() tool; no programmatic subagent spawning within a session
-//   - Parallelism: assign multiple issues simultaneously → each gets its own isolated session
-//   - Mid-run injection: human sends follow-up chat messages via the GitHub UI; no API hook
-//   - Steering is user-driven only (chat prompt: "steer the session"); not programmable
-//   - Copilot CLI binary (Node SEA): no task_steer, subagent, or task_id strings — confirmed
+//   - Parallelism at session level only: assign multiple issues → each gets its own Actions job
+//   - Mid-run injection: human sends follow-up chat in the GitHub UI; not programmable by agent
 //   - Automations: trigger-based (schedule/issue-created/PR-opened); sequential within each run
 //
 // spark model (this file):
