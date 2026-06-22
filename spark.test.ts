@@ -12,7 +12,7 @@ const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434"
 const AGENT_MODEL = process.env.AGENT_MODEL ?? "" // auto-pick if empty
 const JUDGE_MODEL = process.env.JUDGE_MODEL ?? "" // defaults to AGENT_MODEL
 const MAX_AGENT_TURNS = 15
-const TIMEOUT = 120_000
+const TIMEOUT = 300_000
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
