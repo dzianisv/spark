@@ -976,6 +976,39 @@ describe("buildGoalBlock", () => {
     const block = buildGoalBlock("Fix the bug")
     expect(block).toContain('"Fix the bug"')
   })
+
+  test("goal text with regex special chars is preserved verbatim", () => {
+    const goal = "Fix (auth) [v2] module — tokens *must* expire? yes+no"
+    const block = buildGoalBlock(goal)
+    expect(block).toContain(goal)
+  })
+
+  test("multiline goal text is included intact", () => {
+    const goal = "Step 1: run tests\nStep 2: fix failures\nStep 3: commit"
+    const block = buildGoalBlock(goal)
+    expect(block).toContain(goal)
+  })
+
+  test("goal with double-quotes is included", () => {
+    const goal = `Fix the "auth" module`
+    const block = buildGoalBlock(goal)
+    expect(block).toContain(goal)
+  })
+
+  test("strip regex removes the full block", () => {
+    const base = "You are spark, a coding agent."
+    const withGoal = base + buildGoalBlock("Fix the (auth) module [v2] — tokens *must* expire")
+    const stripped = withGoal.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
+    expect(stripped).toBe(base)
+  })
+
+  test("strip regex is idempotent — stripping twice gives same result", () => {
+    const base = "You are spark, a coding agent."
+    const withGoal = base + buildGoalBlock("Fix the (auth) module [v2] — tokens *must* expire")
+    const strippedOnce = withGoal.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
+    const strippedTwice = strippedOnce.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
+    expect(strippedTwice).toBe(strippedOnce)
+  })
 })
 
 describe("buildSupervisorFeedback", () => {
