@@ -1567,4 +1567,157 @@ describe("Task parallel system", () => {
     const result = await TaskWait.execute({ task_ids: ["completely-unknown-id"] })
     expect(result).toContain("not found")
   })
+
+  // ── runSubAgent state-machine tests ──────────────────────────────────────
+  // The inner agent loop normally calls ollamaChat (needs Ollama running). We
+  // inject a deterministic fake chatFn (the 4th makeTaskTools param) that hands
+  // control back to the test at every turn boundary, so cancel/steer/grace logic
+  // can be driven step-by-step with zero network and zero flakiness.
+  //
+  // Determinism note: Task/TaskSteer/TaskCancel mutate the handle synchronously
+  // (no await before the mutation), so a TaskSteer/TaskCancel call issued right
+  // after reply(n) lands before the agent reaches turn n+1's boundary.
+
+  function deferred<T>() {
+    let resolve!: (v: T) => void
+    let reject!: (e: unknown) => void
+    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej })
+    return { promise, resolve, reject }
+  }
+
+  // A controllable fake chatFn: each agent turn blocks until the test supplies a
+  // reply via reply(n). waitTurn(n) resolves with the messages the agent passed
+  // at turn n (so we can assert on injected <steer>/<cancel> blocks).
+  function makeChatChannel() {
+    const arrived: Array<ReturnType<typeof deferred<SparkMessage[]>>> = []
+    const replies: Array<ReturnType<typeof deferred<SparkMessage>>> = []
+    const ensure = (i: number) => {
+      if (!arrived[i]) arrived[i] = deferred<SparkMessage[]>()
+      if (!replies[i]) replies[i] = deferred<SparkMessage>()
+    }
+    let turn = 0
+    const chatFn = (async (_model: string, messages: SparkMessage[], _tools: unknown, _cb: unknown, _fmt: unknown, signal?: AbortSignal) => {
+      const i = turn++
+      ensure(i)
+      arrived[i].resolve(messages.map(m => ({ ...m })))
+      if (signal) {
+        if (signal.aborted) throw new Error("aborted")
+        signal.addEventListener("abort", () => replies[i].reject(new Error("aborted")), { once: true })
+      }
+      return replies[i].promise
+    }) as unknown as typeof sparkOllamaChat
+    return {
+      chatFn,
+      waitTurn: (i: number) => { ensure(i); return arrived[i].promise },
+      reply: (i: number, msg: SparkMessage) => { ensure(i); replies[i].resolve(msg) },
+    }
+  }
+
+  const toolCall = { id: "tc", function: { name: "noop", arguments: {} } }
+  const startTask = async (Task: ReturnType<typeof getTaskToolsWith>["Task"], prompt = "do work") => {
+    const msg = await Task.execute({ description: "scripted", prompt })
+    const id = msg.split("\n")[0].replace("task_id:", "").trim()
+    return id
+  }
+
+  function getTaskToolsWith(chatFn: typeof sparkOllamaChat) {
+    const tools = makeTaskTools(stubModel, stubSystemPrompt, stubTools, chatFn)
+    const byName = new Map(tools.map(t => [t.definition.function.name, t]))
+    return {
+      Task: byName.get("Task")!,
+      TaskWait: byName.get("TaskWait")!,
+      TaskSteer: byName.get("TaskSteer")!,
+      TaskCancel: byName.get("TaskCancel")!,
+    }
+  }
+
+  test("runSubAgent — normal completion: no tool calls => status done", async () => {
+    const ch = makeChatChannel()
+    const { Task, TaskWait } = getTaskToolsWith(ch.chatFn)
+    const id = await startTask(Task)
+
+    await ch.waitTurn(0)
+    ch.reply(0, { role: "assistant", content: "all finished" })  // no tool_calls => break
+
+    const result = await TaskWait.execute({ task_ids: [id] })
+    expect(result).toContain("all finished")
+    expect(result).toContain('status="done"')
+  })
+
+  test("runSubAgent — TaskSteer injects <steer> at the next turn boundary", async () => {
+    const ch = makeChatChannel()
+    const { Task, TaskWait, TaskSteer } = getTaskToolsWith(ch.chatFn)
+    const id = await startTask(Task)
+
+    await ch.waitTurn(0)
+    ch.reply(0, { role: "assistant", content: "working", tool_calls: [toolCall] })  // keep looping
+    await TaskSteer.execute({ task_id: id, message: "use approach B" })
+
+    const turn1 = await ch.waitTurn(1)
+    const turn1Json = JSON.stringify(turn1)
+    expect(turn1Json).toContain("<steer>")
+    expect(turn1Json).toContain("use approach B")
+    ch.reply(1, { role: "assistant", content: "done after steer" })  // stop
+
+    const result = await TaskWait.execute({ task_ids: [id] })
+    expect(result).toContain("done after steer")
+    expect(result).toContain('status="done"')
+  })
+
+  test("runSubAgent — TaskCancel injects <cancel> and gives CANCEL_GRACE_TURNS turns", async () => {
+    const ch = makeChatChannel()
+    const { Task, TaskWait, TaskCancel } = getTaskToolsWith(ch.chatFn)
+    const id = await startTask(Task)
+
+    await ch.waitTurn(0)
+    ch.reply(0, { role: "assistant", content: "turn0", tool_calls: [toolCall] })
+    await TaskCancel.execute({ task_id: id, reason: "no longer needed" })
+
+    // Grace turn 1: cancel injected, agent keeps emitting tool calls.
+    const turn1 = await ch.waitTurn(1)
+    expect(JSON.stringify(turn1)).toContain("<cancel>")
+    ch.reply(1, { role: "assistant", content: "grace1", tool_calls: [toolCall] })
+
+    // Grace turn 2: last allowed turn; loop breaks after this regardless of tool calls.
+    await ch.waitTurn(2)
+    ch.reply(2, { role: "assistant", content: "final summary", tool_calls: [toolCall] })
+
+    const result = await TaskWait.execute({ task_ids: [id] })
+    expect(result).toContain("final summary")
+    expect(result).toContain('status="cancelled"')
+  })
+
+  test("runSubAgent — cancel beats steer: queued steer is dropped", async () => {
+    const ch = makeChatChannel()
+    const { Task, TaskWait, TaskSteer, TaskCancel } = getTaskToolsWith(ch.chatFn)
+    const id = await startTask(Task)
+
+    await ch.waitTurn(0)
+    ch.reply(0, { role: "assistant", content: "turn0", tool_calls: [toolCall] })
+    await TaskSteer.execute({ task_id: id, message: "steer that should be dropped" })
+    await TaskCancel.execute({ task_id: id, reason: "abort it" })
+
+    const turn1 = await ch.waitTurn(1)
+    const turn1Json = JSON.stringify(turn1)
+    expect(turn1Json).toContain("<cancel>")
+    expect(turn1Json).not.toContain("steer that should be dropped")
+    ch.reply(1, { role: "assistant", content: "wrapped up" })  // stop during grace
+
+    const result = await TaskWait.execute({ task_ids: [id] })
+    expect(result).toContain('status="cancelled"')
+  })
+
+  test("runSubAgent — timeout aborts and reports status cancelled with reason", async () => {
+    const ch = makeChatChannel()
+    const { Task, TaskWait } = getTaskToolsWith(ch.chatFn)
+    // 20ms timeout; turn 0 never gets a reply, so the abort fires mid-inference.
+    const startMsg = await Task.execute({ description: "slow", prompt: "hang", timeout: 20 })
+    const id = startMsg.split("\n")[0].replace("task_id:", "").trim()
+
+    await ch.waitTurn(0)  // agent is parked awaiting a reply that never comes
+
+    const result = await TaskWait.execute({ task_ids: [id] })
+    expect(result).toContain('status="cancelled"')
+    expect(result).toContain("Timed out after 20ms")
+  })
 })
