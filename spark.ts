@@ -264,6 +264,7 @@ export function estimateTokens(messages: Message[]): number {
   for (const m of messages) {
     chars += m.content?.length ?? 0
     if (m.tool_calls) for (const c of m.tool_calls) chars += JSON.stringify(c.function).length
+    if (typeof m.thinking === "string") chars += m.thinking.length
   }
   return Math.round(chars / CHARS_PER_TOKEN)
 }
@@ -334,6 +335,7 @@ export async function compactMessages(model: string, messages: Message[], signal
     signal,
   )
   const summary = reply.content
+  if (signal?.aborted || !summary.trim()) return false
 
   messages.splice(
     1,
@@ -438,21 +440,14 @@ function makeReadFile(): Tool {
 }
 
 async function checkedWrite(filePath: string, content: string): Promise<string | null> {
-  const ext = filePath.split(".").pop()?.toLowerCase()
-  if (ext === "ts" || ext === "tsx" || ext === "js" || ext === "jsx") {
-    const tmpPath = filePath + ".spark_check_tmp"
+  const ext = filePath.split(".").pop()?.toLowerCase() ?? ""
+  const checkExts = ["ts", "tsx", "js", "jsx"]
+  if (checkExts.includes(ext)) {
     try {
-      await writeFile(tmpPath, content, "utf-8")
-      const checkProc = Bun.spawn(["bun", "--check", tmpPath], { stdout: "pipe", stderr: "pipe" })
-      const checkErr = await new Response(checkProc.stderr).text()
-      const checkCode = await checkProc.exited
-      await unlink(tmpPath).catch(() => {})
-      if (checkCode !== 0) {
-        const errMsg = checkErr.replace(new RegExp(tmpPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), filePath)
-        return `Error: syntax check failed before writing ${filePath}:\n${errMsg.slice(0, 1000)}`
-      }
-    } catch {
-      await unlink(tmpPath).catch(() => {})
+      const loader = (ext === "tsx" || ext === "jsx") ? ext : (ext === "ts" ? "ts" : "js") as "ts" | "js" | "tsx" | "jsx"
+      new Bun.Transpiler({ loader }).transformSync(content)
+    } catch (e: unknown) {
+      return `Error: syntax check failed before writing ${filePath}:\n${String(e).slice(0, 1000)}`
     }
   }
   return null
@@ -530,6 +525,10 @@ function makeWriteFile(): Tool {
         // Fuzzy fallback: whitespace-insensitive line matching
         const fuzzy = lineTrimmedMatch(existing, oldStr)
         if (fuzzy) {
+          const fuzzy2 = lineTrimmedMatch(existing.slice(fuzzy.end), oldStr)
+          if (fuzzy2) {
+            return `Error: Multiple fuzzy matches found for oldString — cannot safely patch. Make oldString more specific.`
+          }
           const result = existing.slice(0, fuzzy.start) + newStr + existing.slice(fuzzy.end)
           const checkErr = await checkedWrite(filePath, result)
           if (checkErr) return checkErr
@@ -547,8 +546,6 @@ function makeWriteFile(): Tool {
       const syntaxErr = await checkedWrite(filePath, content)
       if (syntaxErr) return syntaxErr
       const existing = await readFile(filePath, "utf-8").catch(() => null)
-      const checkErr = await checkedWrite(filePath, content)
-      if (checkErr) return checkErr
       await writeFile(filePath, content, "utf-8")
 
       if (existing === null) return `Created new file: ${filePath} (${content.split("\n").length} lines)`
@@ -712,13 +709,16 @@ function makeGrep(): Tool {
       const dir = resolve(String(args.path ?? process.cwd()))
       const rgArgs = ["--line-number", "--no-heading", "--color=never", "--max-count=100"]
       if (args.include) rgArgs.push("--glob", String(args.include))
-      rgArgs.push(String(args.pattern), dir)
+      rgArgs.push("-e", String(args.pattern), "--", dir)
       try {
         const proc = Bun.spawn(["rg", ...rgArgs], { stdout: "pipe", stderr: "pipe" })
-        const output = await new Response(proc.stdout).text()
+        const [output, errText] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+        ])
         const exitCode = await proc.exited
-        if (exitCode === 1) return "No matches found."
-        if (!output.trim()) return "No matches found."
+        if (exitCode >= 2) return `Error: rg failed: ${errText.trim() || "unknown error"}`
+        if (exitCode === 1 || !output.trim()) return "No matches found."
         return truncateLines(output.trim())
       } catch {
         return "Error: ripgrep (rg) not found. Install with: brew install ripgrep"
