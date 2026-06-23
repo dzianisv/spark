@@ -59,18 +59,22 @@ The script will:
 > Aurora exposes a standard OpenAI-compatible API, so any code that already talks  
 > to OpenAI just needs three environment variables changed.
 
-Once `SPARK_BACKEND=openai` support lands in `spark.ts`, run:
-
 ```bash
-SPARK_BACKEND=openai \
 SPARK_API_URL=http://localhost:8080 \
 SPARK_API_KEY=<your-accessToken> \
 bun spark.ts
 ```
 
+Or read the token from the saved file:
+
+```bash
+SPARK_API_URL=http://localhost:8080 \
+SPARK_API_KEY=$(head -1 ~/.aurora/access_tokens.txt) \
+bun spark.ts
+```
+
 | Variable | Value |
 |---|---|
-| `SPARK_BACKEND` | `openai` |
 | `SPARK_API_URL` | `http://localhost:8080` |
 | `SPARK_API_KEY` | your ChatGPT `accessToken` |
 
