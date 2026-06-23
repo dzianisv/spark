@@ -809,8 +809,21 @@ function makeRunTests(): Tool {
           const truncated = lines.length > 150
             ? lines.slice(0, 150).join("\n") + `\n[...${lines.length - 150} lines omitted]`
             : raw
-          const prefix = code !== 0 ? `[TESTS FAILED — exit code: ${code}]\n` : `[TESTS PASSED]\n`
-          done(prefix + `Command: ${cmd}\n\n` + truncated)
+          const noTestsMarkers = [
+            "no test files",      // go
+            "0 tests",            // bun/jest summary lines
+            "no tests ran",       // jest --passWithNoTests
+            "no tests found",     // pytest with no match
+            "collected 0 items",  // pytest
+            "test suite: 0",      // jest
+          ]
+          const hasNoTests = noTestsMarkers.some(m => raw.toLowerCase().includes(m))
+          const label =
+            code === 5 ? "[NO TESTS RAN]"  // pytest: no tests collected
+            : code !== 0 ? `[TESTS FAILED — exit code: ${code}]`
+            : hasNoTests ? "[NO TESTS RAN]"
+            : "[TESTS PASSED]"
+          done(label + `\nCommand: ${cmd}\n\n` + truncated)
         })
         proc.on("error", (err) => done(`Error running tests: ${err.message}\nCommand: ${cmd}`))
       })
@@ -914,8 +927,12 @@ function makeFindSymbol(): Tool {
 
       try {
         const proc = Bun.spawn(["rg", ...rgArgs], { stdout: "pipe", stderr: "pipe" })
-        const output = await new Response(proc.stdout).text()
+        const [output, errText] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+        ])
         const exitCode = await proc.exited
+        if (exitCode >= 2) return `Error: rg failed: ${errText.trim() || "unknown error"}`
         if (exitCode === 1 || !output.trim()) return `No definition found for '${name}'`
         const lines = output.trim().split("\n").slice(0, 50)
         return lines.join("\n")
@@ -1203,12 +1220,14 @@ export function makeTaskTools(
         if (!reply.tool_calls?.length) break
 
         for (const call of reply.tool_calls) {
+          if (handle.abort.signal.aborted) break
           const tool = toolMap.get(call.function.name)
           const result = tool
             ? await tool.execute(call.function.arguments)
             : `Error: unknown tool '${call.function.name}'`
           subMessages.push({ role: "tool", content: result, tool_name: call.function.name, tool_call_id: call.id })
         }
+        if (handle.abort.signal.aborted) break
 
         // Decrement grace AFTER the LLM call + tool execution so agent gets exactly
         // CANCEL_GRACE_TURNS full turns to wrap up (not CANCEL_GRACE_TURNS - 1)
