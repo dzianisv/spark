@@ -1113,6 +1113,166 @@ function makeLoadSkill(skillMap: Map<string, string>): Tool {
 }
 
 // ── Parallel Task Registry ────────────────────────────────────────────────────
+//
+// Research: how GitHub Copilot CLI, opencode, and Claude Code implement parallel
+// subagents and mid-run message passing — and how spark maps to each pattern.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 1. GITHUB COPILOT CLI                                                       │
+// │    (the process running spark — /fleet /tasks /sidekicks /subagents)        │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+// Spawn (non-blocking, background):
+//   task(name, prompt, agent_type, mode:"background")
+//   → returns agent_id immediately; agent runs concurrently on the JS event loop
+//   → agent_type selects a named specialist: "explore", "general-purpose",
+//     "rubber-duck", "code-review", "security-review", or custom agents under
+//     ~/.agents/ (e.g. "gsd-code-reviewer", "gsd-executor", "gsd-planner")
+//
+// Await result:
+//   read_agent(agent_id, wait:true, timeout?)
+//   → blocks until the agent's current turn completes; returns full turn history
+//   → read_agent(agent_id, since_turn:N) for delta reads (only turns after N)
+//   → called automatically when the completion notification arrives
+//
+// Mid-run message injection (= task_steer equivalent):
+//   write_agent(agent_id, message)
+//   → delivers message as a new user turn to a running OR idle background agent
+//   → if agent is running: queued, delivered after the current turn completes
+//   → if agent is idle: wakes the agent to process the message as a new turn
+//   → supports full multi-turn back-and-forth: write → wait → write again
+//   → confirmed: used in this session for research refinement and follow-up
+//
+// List/enumerate:
+//   list_agents(include_completed?)
+//   → all active and completed background agents; status and agent_id
+//   → statuses: running, idle, completed, failed, cancelled
+//   → "(steerable)" = accepts write_agent; "(one-shot)" = read-only
+//
+// Completion notification:
+//   → automatic event-driven notification when a background agent finishes
+//   → no polling needed; notification arrives as the next agent turn
+//   → pattern: launch → do independent work → wait for notification → read_agent
+//
+// Parallel pattern (used throughout this session):
+//   task(A, mode:"background") → id_A    // start agent A
+//   task(B, mode:"background") → id_B    // start agent B concurrently
+//   // do independent work while both run …
+//   read_agent(id_A, wait:true)           // collect A
+//   read_agent(id_B, wait:true)           // collect B
+//
+// /fleet  — enables parallel subagent execution mode (auto-fans out work)
+// /tasks  — view and manage running subagents and shell commands
+//
+// Agent statefulness:
+//   → agents retain full conversation history across write_agent turns
+//   → idle agents (done with last turn) re-engage on the next write_agent
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 2. OPENCODE                                                                  │
+// │    (packages/opencode/src/tool/task.ts + task-interrupt.ts + interrupt.ts)  │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+// Spawn:
+//   Task({ description, prompt, subagent_type, directory?, task_id? })
+//   → creates child Session with parentID; runs via ops.prompt() (Effect fiber)
+//   → returns task_id (session UUID) in the tool result string
+//   → task_id passed back to Task() resumes the prior session (stateful)
+//   → subagent_type: "general", "explore", "scout", or user-defined agents
+//
+// Parallel (session/prompt.ts:1561, workflow/index.ts:405):
+//   Effect.forEach(subtasks, handleSubtask, { concurrency: 16 })
+//   → up to 16 parallel Effect fibers per turn
+//   → workflow ctx.parallel(tasks, { concurrencyLimit? }) — worker pool via
+//     withConcurrency(): shared queue drained by Promise.all of N workers
+//
+// Mid-run injection — task_steer (task-interrupt.ts):
+//   task_steer({ task_id, reason })
+//   → Interrupt.request({ sessionID, intent:"steer", reason, origin:"parent" })
+//   → writes to pending Map<SessionID, Pending> (in-memory shared singleton)
+//   → cancel beats steer: if cancel already queued, steer is silently dropped
+//   → child calls Interrupt.consume(sessionID) at EVERY turn start
+//   → steer → injects renderSteer(reason) as user msg, then continues normally
+//   → renderSteer: <steer>\n<reason>…</reason>\n</steer>
+//
+// Graceful cancel — task_cancel:
+//   → Interrupt.request(intent:"cancel") → renderCancel injected
+//   → child gets CANCEL_GRACE_TURNS=2 turns to wrap up before forced stop
+//   → renderCancel: <cancel>\n<reason>…</reason>\n</cancel>
+//
+// Hard abort — task_abort:
+//   → Interrupt.abortChild() → Effect interrupt (no grace, immediate kill)
+//
+// Completion notification (session/status.ts):
+//   → session.idle Bus event fires when child transitions to idle status
+//   → plugin event handler: event.type === "session.idle" → runSupervisor()
+//   → waitForResponse() polling fallback: 2s interval, checks time.completed
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 3. CLAUDE CODE — agents-supervisor                                          │
+// │    (agents-supervisor/core/assessment.mjs, bin/on-stop.mjs)                │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+// Spawn:
+//   CC native Task() tool — creates a child context window for the subagent
+//   → no task_id / no resume; each Task call is a fresh context
+//   → subagent inherits core tools; Task itself excluded (no recursive spawning)
+//
+// Parallel:
+//   Caller launches multiple subagent Promise chains simultaneously (Promise.all)
+//   → no concurrency limit; all chains run on the JS event loop
+//   → supervisor itself is strictly sequential: activeSupervisors Set<string>
+//     ensures only one supervisor loop runs per session at a time
+//
+// Mid-run injection / completion:
+//   → Stop hook: CC calls bin/on-stop.mjs synchronously on EVERY agent stop
+//   → hook writes JSON to stdout:
+//       { decision:"block", reason:"<feedback>" }  → CC injects as user turn
+//       { decision:"proceed" }                     → agent allowed to stop
+//   → stop_hook_active guard prevents infinite hook loops
+//   → OpenCode variant: supervisor uses client.session.promptAsync() over HTTP
+//   → no real-time steering; supervisor only acts AFTER the agent stops
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 4. GITHUB COPILOT CLOUD AGENT                                               │
+// │    (docs.github.com/en/copilot/concepts/agents/cloud-agent)                │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+//   → Runs in GitHub Actions ephemeral VM; task IS the session (1 issue = 1 job)
+//   → No Task() tool; no in-session subagent spawning
+//   → Parallelism at session level only: multiple issues → multiple Actions jobs
+//   → Mid-run injection: human types in GitHub chat UI; not agent-programmable
+//   → Automations: trigger-based (cron / issue-opened / PR-opened); sequential
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 5. COMPARISON                                                               │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+//  Dimension        │ Copilot CLI          │ opencode             │ CC agents-sup     │ spark
+// ──────────────────┼──────────────────────┼──────────────────────┼───────────────────┼──────────────────
+//  Spawn API        │ task(agent_type,      │ Task({subagent_type, │ Task() native     │ Task({description,
+//                   │   mode:"background") │   task_id?,...})     │   (no resume)     │   prompt})
+//  Parallel         │ JS event loop;        │ Effect.forEach       │ Promise.all       │ Promise.all via
+//                   │   /fleet mode        │   concurrency:16     │   (no limit)      │   TaskWait
+//  Mid-run inject   │ write_agent(id, msg) │ task_steer →         │ Stop hook stdout  │ (timeout/abort)
+//                   │   (running or idle)  │   Interrupt.Service  │   {block, reason} │
+//  Await result     │ read_agent(id,        │ ops.prompt() await   │ Promise.then      │ TaskWait([ids])
+//                   │   wait:true)         │   + session.idle evt │   inline          │   Promise.all
+//  Cancel           │ write_agent("stop…") │ task_cancel →        │ n/a (hook stops)  │ timeout abort
+//                   │                      │   CANCEL_GRACE=2     │                   │
+//  Notify           │ auto event-driven    │ session.idle Bus     │ CC calls hook     │ Promise resolve
+//  Resume session   │ write_agent wakes    │ task_id param        │ no                │ no
+//                   │   idle agent         │   reuses session     │                   │
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │ 6. SPARK IMPLEMENTATION CHOICES                                             │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+//   - Task() fires a background subagent Promise; returns task_id immediately
+//   - TaskWait([ids]) runs Promise.all → N agents run concurrently
+//   - No steer/cancel tools: timeout + user abort (Esc/Ctrl+C) handle it
+//   - No resume: local Ollama sessions are cheap; just spawn a fresh Task
+//   - No Effect fibers or Bus events: JS Promise + Map is sufficient for Ollama
 
 export interface SubAgentHandle {
   id: string
@@ -1649,6 +1809,78 @@ async function selectModel(models: string[], current: string, rl: ReturnType<typ
 }
 
 // ── Goal Supervisor ──────────────────────────────────────────────────────────
+//
+// DESIGN CONTEXT: how GitHub Copilot and Claude Code handle goal supervision,
+// and how spark.ts adapts those ideas for a local single-file Ollama agent.
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ GitHub Copilot Cloud Agent (docs.github.com/en/copilot/how-tos/use-    │
+// │ copilot-agents/cloud-agent)                                             │
+// │                                                                         │
+// │ Copilot has no "/goal" command. The task IS the goal — it comes from    │
+// │ an issue, chat message, PR comment, CLI prompt, or API call. Copilot   │
+// │ runs autonomously in a cloud sandbox, creates a branch, makes changes, │
+// │ and opens a PR. Completion is defined by: PR created + built-in code   │
+// │ review + security scan pass. There is no interactive judge loop —      │
+// │ the agent either finishes and ships a PR, or stalls and times out.     │
+// │                                                                         │
+// │ Key features:                                                           │
+// │ - Built-in Copilot code review (second-opinion on every PR)            │
+// │ - Security validation (hardcoded secrets, insecure deps)               │
+// │ - Automations: trigger on schedule or GitHub events (issue opened etc) │
+// │ - No explicit attempt cap exposed to user; cloud infra enforces limits  │
+// └─────────────────────────────────────────────────────────────────────────┘
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ Claude Code agents-supervisor plugin (github.com/dzianisv/             │
+// │ agents-supervisor — core/goal.mjs, opencode/supervisor-impl.ts)        │
+// │                                                                         │
+// │ 3 supervisor modes:                                                     │
+// │   reflection (default) — judge fires on every Stop hook, no goal       │
+// │   goal                 — /supervisor:goal <condition> sets explicit     │
+// │                          goal; judge checks it each turn               │
+// │   autopilot            — skip judge, always continue until budget gone  │
+// │                                                                         │
+// │ Goal state (per-session JSON, mode 0600):                               │
+// │   { condition, status, attempts, tokenBaseline, startedAt, deadline }   │
+// │   DEFAULT_MAX_ATTEMPTS = 16                                             │
+// │   DEFAULT_MAX_GOAL_DURATION_MS = 30 * 60 * 1000  (30 min deadline)     │
+// │                                                                         │
+// │ Goal injection (buildGoalRequirementSection):                           │
+// │   "## GOAL (mandatory completion requirement)"                          │
+// │   + evidence rule: "bare assertion does NOT count as evidence"          │
+// │                                                                         │
+// │ 2-stage judge:                                                          │
+// │   Stage 1: agent self-assessment JSON (status/stuck/missing/evidence)  │
+// │   Stage 2: external judge prompt validates the self-assessment          │
+// │                                                                         │
+// │ Escalating feedback (buildEscalatingFeedback):                          │
+// │   - Planning loop detected (read-only tools, no writes) → hard STOP    │
+// │   - Action loop detected (same commands repeated) → change approach    │
+// │   - Normal: gentle → missing/next_actions list → stuck warning         │
+// │                                                                         │
+// │ Antipatterns mined from 227 real agent stops (78% premature):          │
+// │   PERMISSION-SEEKING, STOPPED-WITH-TODOS, VERIFICATION-DEFERRAL,       │
+// │   FALSE-COMPLETE                                                        │
+// └─────────────────────────────────────────────────────────────────────────┘
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ spark.ts — simplified adaptation for local Ollama                      │
+// │                                                                         │
+// │ 2 states instead of 3 modes:                                            │
+// │   goal string (null = off)  — set via /goal or synthesised by LLM      │
+// │   autopilot bool            — extends tool budget to 200 rounds,       │
+// │                               adds autopilot_exit tool                 │
+// │                                                                         │
+// │ Key differences from CC:                                                │
+// │ - No deadline (30-min wall would kill long Ollama tasks)               │
+// │ - No self-assessment stage (adds a full LLM round per check)           │
+// │ - No per-session JSON (single .agents/spark/goal file, plain text)     │
+// │ - deriveGoal(): LLM synthesises goal from conversation — CC requires   │
+// │   the user to write the condition manually                             │
+// │ - Bounded check cap: interactive=5, autopilot=50 (CC default: 16)      │
+// │ - "copilot: ● Started autopilot objective #N" display format           │
+// └─────────────────────────────────────────────────────────────────────────┘
 
 /**
  * Injects the active goal into the system prompt as a MANDATORY completion
