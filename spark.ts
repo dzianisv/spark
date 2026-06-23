@@ -135,7 +135,7 @@ async function ollamaChatRaw(
   while (true) {
     if (signal?.aborted) break
     const { done, value } = await reader.read()
-    if (done) break
+    if (done || signal?.aborted) break
 
     buf += decoder.decode(value, { stream: true })
     const lines = buf.split("\n")
@@ -2027,7 +2027,9 @@ export async function checkGoal(model: string, goal: string, messages: Message[]
    */
   const lastAssistant = [...messages].reverse().find(m => m.role === "assistant")?.content ?? ""
   // Skip injected supervisor/system messages when finding the last real user message.
-  const INJECTED_PREFIXES = ["[supervisor]", "[autopilot]", "[System:"]
+  // Includes <system-reminder> (AUTOPILOT_NUDGE) and "Autopilot completed" (AUTOPILOT_SUMMARY_PROMPT)
+  // so the judge always sees the original task message, not autopilot bookkeeping noise.
+  const INJECTED_PREFIXES = ["[supervisor]", "[autopilot]", "[System:", "<system-reminder>", "Autopilot completed"]
   const lastUser = [...messages].reverse().find(
     m => m.role === "user" &&
     typeof m.content === "string" &&
@@ -2506,7 +2508,7 @@ Start with PHASE 1 now.`
     }
     const keypressHandler = (_: unknown, key: { name?: string; ctrl?: boolean } | undefined) => {
       if (!key) return
-      if (key.name === "escape") {
+      if (key.name === "escape" || (key.ctrl && key.name === "c")) {
         process.stdout.write(`\n${COLORS.yellow}⚡ Interrupted${COLORS.reset}\n`)
         turnAbort.abort()
       } else if (key.ctrl && key.name === "q") {
@@ -2686,6 +2688,8 @@ Start with PHASE 1 now.`
       }
 
       if (!goal) break supervise
+      // Trust an explicit autopilot_exit — agent signalled done, skip the judge.
+      if (autopilotState.exited) { console.log(`✓ supervisor: agent called autopilot_exit`); break supervise }
       goalChecks++
       if (goalChecks > MAX_GOAL_CHECKS) {
         console.log(`${COLORS.yellow}⚠ supervisor: reached ${MAX_GOAL_CHECKS} check limit${autopilot ? "" : " — use /autopilot for longer runs"}${COLORS.reset}`)

@@ -928,6 +928,39 @@ describe("goal supervisor v2 — last-2-message judge", () => {
     // and "Done. Ran eslint, 0 errors." as lastAssistant → should be reached
     expect(verdict.reached).toBe(true)
   }, TIMEOUT)
+
+  test("AUTOPILOT_NUDGE is skipped when finding lastUser", async () => {
+    // Bug: AUTOPILOT_NUDGE starts with <system-reminder>, not a filtered prefix.
+    // The judge must skip it and find the original task message instead.
+    // If NOT filtered, the judge sees "Autopilot mode remains active" as lastUser
+    // and may hallucinate a false-negative — keep the evidence strong so we can
+    // detect regressions where the wrong lastUser leaks into the judge.
+    const strongEvidence = `I created hello.ts with content:\n\`\`\`\nconsole.log("hello world")\n\`\`\`\nI ran it: \`bun hello.ts\` → output: \`hello world\`. Task complete.`
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "Create a file hello.ts that prints hello world" },
+      { role: "assistant", content: strongEvidence },
+      { role: "user", content: AUTOPILOT_NUDGE },
+    ]
+    const verdict = await checkGoal(judgeModel, "Create a file hello.ts that prints hello world", messages)
+    // Judge must see the original task (not AUTOPILOT_NUDGE) as lastUser → reached
+    expect(verdict.reached).toBe(true)
+  }, TIMEOUT)
+
+  test("AUTOPILOT_SUMMARY_PROMPT is skipped when finding lastUser", async () => {
+    // Bug: "Autopilot completed. Briefly summarize…" was found as lastUser, confusing judge.
+    const strongEvidence = `Created hello.ts:\n\`\`\`\nconsole.log("hello world")\n\`\`\`\nRan \`bun hello.ts\`, output: \`hello world\`. File verified. Goal complete.`
+    const messages: SparkMessage[] = [
+      { role: "system", content: "You are spark." },
+      { role: "user", content: "Create a file hello.ts that prints hello world" },
+      { role: "assistant", content: "I have created the file hello.ts with a console.log statement and verified it runs correctly. The tests all pass." },
+      { role: "user", content: AUTOPILOT_SUMMARY_PROMPT },
+      { role: "assistant", content: strongEvidence },
+    ]
+    const verdict = await checkGoal(judgeModel, "Create a file hello.ts that prints hello world", messages)
+    // Judge must skip the summary prompt and see the real task completion evidence → reached
+    expect(verdict.reached).toBe(true)
+  }, TIMEOUT)
 })
 
 // ── Autopilot Tests ──────────────────────────────────────────────────────────
