@@ -1809,14 +1809,35 @@ async function spawnSandbox(): Promise<void> {
     containerScript = `/spark/${basename(scriptPath)}`
   }
 
+  // Use spark-local image (has Aurora) if built; fall back to plain bun image.
+  const localImage = "spark-local"
+  const useLocalImage = await new Promise<boolean>(res => {
+    const p = spawn("docker", ["image", "inspect", localImage], { stdio: "ignore" })
+    p.on("close", code => res(code === 0))
+    p.on("error", () => res(false))
+  })
+  const image = useLocalImage ? localImage : "oven/bun:alpine"
+
+  // Pass CHATGPT_ACCESS_TOKEN so Aurora can start inside the container.
+  const tokenEnv = process.env.CHATGPT_ACCESS_TOKEN
+    ? ["-e", `CHATGPT_ACCESS_TOKEN=${process.env.CHATGPT_ACCESS_TOKEN}`]
+    : []
+
+  // Forward explicit API config when already set by the user.
+  const apiEnv = process.env.SPARK_API_URL
+    ? ["-e", `SPARK_API_URL=${process.env.SPARK_API_URL}`, "-e", `SPARK_API_KEY=${process.env.SPARK_API_KEY ?? ""}`]
+    : []
+
   const dockerArgs = [
     "run", "--rm", "-it",
     "--add-host=host.docker.internal:host-gateway",  // Linux compat; macOS Docker Desktop has it built-in
     "-e", `OLLAMA_URL=${dockerOllamaUrl}`,
     "-e", "SPARK_SANDBOX=1",
+    ...tokenEnv,
+    ...apiEnv,
     ...volumes.flatMap(v => ["-v", v]),
     "-w", "/workspace",
-    "oven/bun:alpine",
+    image,
     "bun", containerScript,
   ]
 
