@@ -688,16 +688,15 @@ function makeEval(): Tool {
       // Wrap in an IIFE that prints the return value so the agent sees the result.
       const wrapped = `const __r = await (async()=>{ ${code} })(); if (__r !== undefined) console.log(__r)`
       return new Promise<string>((done) => {
-        const proc = Bun.spawn(["bun", "--eval", wrapped], {
+        const proc = spawn("bun", ["--eval", wrapped], {
           cwd: process.cwd(),
-          stdout: "pipe",
-          stderr: "pipe",
-          env: process.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: process.env as Record<string, string>,
         })
         const chunks: Buffer[] = []
         const errChunks: Buffer[] = []
-        proc.stdout.on("data", (d: Buffer) => chunks.push(d))
-        proc.stderr.on("data", (d: Buffer) => errChunks.push(d))
+        proc.stdout!.on("data", (d: Buffer) => chunks.push(d))
+        proc.stderr!.on("data", (d: Buffer) => errChunks.push(d))
         const TIMEOUT_MS = 30_000
         const timer = setTimeout(() => { proc.kill(); done("Error: Eval timed out after 30s") }, TIMEOUT_MS)
         proc.on("close", (code: number | null) => {
