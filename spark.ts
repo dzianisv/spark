@@ -261,6 +261,188 @@ export async function ollamaChat(
   }
 }
 
+type ToolCallAccum = { id: string; name: string; args: string }
+
+export async function openaiChatRaw(
+  model: string,
+  messages: Message[],
+  tools: ToolDef[],
+  callbacks: StreamCallbacks | undefined,
+  signal?: AbortSignal,
+): Promise<Message> {
+  const serialized = messages.map(m => {
+    const base = m.thinking ? { ...m, thinking: undefined } : { ...m }
+    if (base.role === "tool") {
+      // OpenAI doesn't want tool_name on tool result messages
+      const { tool_name, ...rest } = base as typeof base & { tool_name?: string }
+      void tool_name
+      return rest
+    }
+    return base
+  })
+
+  const res = await fetch(`${process.env.SPARK_API_URL}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${process.env.SPARK_API_KEY || ""}`,
+    },
+    body: JSON.stringify({ model, messages: serialized, tools, stream: true }),
+    signal,
+  })
+
+  if (res.status === 401) {
+    throw new Error("OpenAI 401: token expired or invalid. Re-run aurora-setup.ts")
+  }
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`OpenAI error ${res.status}: ${text}`)
+  }
+
+  const contentType = res.headers.get("content-type") ?? ""
+
+  // Non-streaming fallback (Aurora forces JSON when tools are present)
+  if (contentType.includes("application/json")) {
+    const data = (await res.json()) as {
+      choices: [{
+        message: {
+          role: string
+          content?: string
+          tool_calls?: { id: string; type: string; function: { name: string; arguments: string } }[]
+        }
+      }]
+    }
+    const msg = data.choices[0].message
+    const content = msg.content ?? ""
+    if (content) callbacks?.onContent?.(content)
+    const toolCalls: ToolCall[] = (msg.tool_calls ?? []).map(tc => ({
+      id: tc.id,
+      function: {
+        name: tc.function.name,
+        arguments: (() => { try { return JSON.parse(tc.function.arguments) } catch { return {} } })(),
+      },
+    }))
+    const result: Message = { role: "assistant", content }
+    if (toolCalls.length) result.tool_calls = toolCalls
+    return result
+  }
+
+  // SSE streaming path
+  const reader = res.body?.getReader()
+  if (!reader) throw new Error("No response body")
+
+  const decoder = new TextDecoder()
+  let content = ""
+  let buf = ""
+  const toolCallMap = new Map<number, ToolCallAccum>()
+
+  while (true) {
+    if (signal?.aborted) break
+    const { done, value } = await reader.read()
+    if (done || signal?.aborted) break
+
+    buf += decoder.decode(value, { stream: true })
+    const lines = buf.split("\n")
+    buf = lines.pop() ?? ""
+
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed || !trimmed.startsWith("data:")) continue
+      const payload = trimmed.slice(5).trim()
+      if (payload === "[DONE]") break
+
+      let chunk: {
+        choices: [{
+          delta: {
+            content?: string
+            tool_calls?: { index: number; id?: string; type?: string; function?: { name?: string; arguments?: string } }[]
+          }
+          finish_reason?: string | null
+        }]
+      }
+      try { chunk = JSON.parse(payload) } catch { continue }
+
+      const delta = chunk.choices?.[0]?.delta
+      if (!delta) continue
+
+      if (delta.content) {
+        content += delta.content
+        callbacks?.onContent?.(delta.content)
+      }
+
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index
+          if (!toolCallMap.has(idx)) {
+            toolCallMap.set(idx, { id: tc.id ?? "", name: tc.function?.name ?? "", args: "" })
+          } else {
+            const accum = toolCallMap.get(idx)!
+            if (tc.id) accum.id = tc.id
+            if (tc.function?.name) accum.name = tc.function.name
+          }
+          if (tc.function?.arguments) {
+            toolCallMap.get(idx)!.args += tc.function.arguments
+          }
+        }
+      }
+    }
+  }
+
+  const toolCalls: ToolCall[] = []
+  for (const [, accum] of [...toolCallMap.entries()].sort(([a], [b]) => a - b)) {
+    let args: Record<string, unknown>
+    try { args = JSON.parse(accum.args) } catch { args = {} }
+    toolCalls.push({ id: accum.id, function: { name: accum.name, arguments: args } })
+  }
+
+  const result: Message = { role: "assistant", content }
+  if (toolCalls.length) result.tool_calls = toolCalls
+  return result
+}
+
+async function openaiModels(): Promise<string[]> {
+  try {
+    const res = await fetch(`${process.env.SPARK_API_URL}/v1/models`, {
+      headers: { Authorization: `Bearer ${process.env.SPARK_API_KEY || ""}` },
+    })
+    if (!res.ok) return []
+    const data = (await res.json()) as { data?: { id: string }[] }
+    return (data.data ?? []).map(m => m.id)
+  } catch { return [] }
+}
+
+async function openaiModelInfo(model: string): Promise<ModelInfo> {
+  const CTX: Record<string, number> = {
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4-turbo": 128000,
+    "gpt-4": 8192,
+    "gpt-3.5-turbo": 16385,
+    "o1": 200000,
+    "o1-mini": 128000,
+    "o3": 200000,
+    "o3-mini": 200000,
+    "o4-mini": 200000,
+    "gpt-5": 200000,
+    "gpt-5-mini": 128000,
+  }
+  // Prefix match for versioned names like "gpt-4o-2024-11-20"
+  const ctx = CTX[model] ?? Object.entries(CTX).find(([k]) => model.startsWith(k))?.[1] ?? 128000
+  return { capabilities: [], contextLength: ctx }
+}
+
+export async function openaiChat(
+  model: string,
+  messages: Message[],
+  tools: ToolDef[],
+  callbacks?: StreamCallbacks,
+  format?: unknown,
+  signal?: AbortSignal,
+  forceThink?: boolean,
+): Promise<Message> {
+  return openaiChatRaw(model, messages, tools, callbacks, signal)
+}
+
 async function ollamaModels(): Promise<string[]> {
   const res = await fetch(`${getOllamaUrl()}/api/tags`)
   if (!res.ok) return []
@@ -2180,12 +2362,23 @@ async function main() {
     process.exit(0)
   }
 
-  // 1. Check Ollama
-  const models = await ollamaModels()
-  if (models.length === 0) {
-    console.error(`${COLORS.red}Error: No Ollama models found. Is Ollama running?${COLORS.reset}`)
-    console.error(`${COLORS.dim}Start it with: ollama serve${COLORS.reset}`)
-    process.exit(1)
+  // 1. Check backend (OpenAI-compat if SPARK_API_URL set, else Ollama)
+  const isOpenAI = Boolean(process.env.SPARK_API_URL)
+
+  let models: string[]
+  if (isOpenAI) {
+    models = await openaiModels()
+    if (models.length === 0) {
+      console.error(`${COLORS.red}Error: No models returned from ${process.env.SPARK_API_URL}. Is Aurora running?${COLORS.reset}`)
+      process.exit(1)
+    }
+  } else {
+    models = await ollamaModels()
+    if (models.length === 0) {
+      console.error(`${COLORS.red}Error: No Ollama models found. Is Ollama running?${COLORS.reset}`)
+      console.error(`${COLORS.dim}Start it with: ollama serve${COLORS.reset}`)
+      process.exit(1)
+    }
   }
 
   // Try saved model first, fall back to auto-pick
@@ -2224,8 +2417,9 @@ async function main() {
   const systemPrompt = buildSystemPrompt(agentInstructions, skillList, currentModel, gitContext)
 
   // 5. Build full tool set with Task-family tools having a lazy systemPrompt reference
+  const chatFn = isOpenAI ? openaiChat : ollamaChat
   const buildTools = () => {
-    const taskTools = makeTaskTools(currentModel, systemPrompt, coreTools)
+    const taskTools = makeTaskTools(currentModel, systemPrompt, coreTools, chatFn)
     return [...coreTools, ...taskTools]
   }
 
@@ -2247,6 +2441,9 @@ async function main() {
   let goalIsExplicit = false
 
   printHeader(currentModel, skillMap.size)
+  if (isOpenAI) {
+    console.log(`${COLORS.dim}Backend: OpenAI-compat  ${process.env.SPARK_API_URL}${COLORS.reset}`)
+  }
 
   // Announce restored goal after header so user knows why the supervisor may kick in
   if (goal) {
@@ -2337,7 +2534,7 @@ async function main() {
 
     if (trimmed === "/models") {
       try {
-        const freshModels = await ollamaModels()
+        const freshModels = isOpenAI ? await openaiModels() : await ollamaModels()
         currentModel = await selectModel(freshModels, currentModel, rl)
       } catch (err: unknown) {
         console.log(`⚠ /models failed: ${err instanceof Error ? err.message : String(err)}`)
@@ -2729,7 +2926,7 @@ Start with PHASE 1 now.`
             }
           }
 
-          const reply = await ollamaChat(currentModel, messages, toolDefsForCall, {
+          const reply = await (isOpenAI ? openaiChat : ollamaChat)(currentModel, messages, toolDefsForCall, {
             onThinking(chunk) {
               clearSpinner()
               if (!thinkingStarted) {
