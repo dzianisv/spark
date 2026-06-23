@@ -69,30 +69,51 @@ interface Tool {
 // ── Ollama Client ────────────────────────────────────────────────────────────
 
 const getOllamaUrl = () => process.env.OLLAMA_URL ?? "http://localhost:11434"
-// Cache stores a Promise so concurrent cold calls for the same model share one /api/show request
-const modelCapabilityCache = new Map<string, Promise<string[]>>()
 
-async function fetchCapabilities(model: string): Promise<string[]> {
+interface ModelInfo {
+  capabilities: string[]
+  contextLength: number  // native max context length from model_info
+}
+
+// Cache stores a Promise so concurrent cold calls for the same model share one /api/show request
+const modelInfoCache = new Map<string, Promise<ModelInfo>>()
+
+async function fetchModelInfo(model: string): Promise<ModelInfo> {
   try {
     const res = await fetch(`${getOllamaUrl()}/api/show`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: model }),
     })
-    if (!res.ok) return []
-    const data = (await res.json()) as { capabilities?: string[] }
-    return data.capabilities ?? []
-  } catch { return [] }
+    if (!res.ok) return { capabilities: [], contextLength: 0 }
+    const data = (await res.json()) as {
+      capabilities?: string[]
+      model_info?: Record<string, unknown>
+    }
+    // model_info has arch-prefixed keys e.g. "qwen35.context_length", "llama.context_length"
+    const info = data.model_info ?? {}
+    const ctxEntry = Object.entries(info).find(([k]) => k.endsWith(".context_length"))
+    const contextLength = typeof ctxEntry?.[1] === "number" ? ctxEntry[1] : 0
+    return { capabilities: data.capabilities ?? [], contextLength }
+  } catch { return { capabilities: [], contextLength: 0 } }
 }
 
-function ollamaCapabilities(model: string): Promise<string[]> {
-  let p = modelCapabilityCache.get(model)
+function ollamaModelInfo(model: string): Promise<ModelInfo> {
+  let p = modelInfoCache.get(model)
   if (!p) {
-    p = fetchCapabilities(model)
-    // only cache non-empty results — missing capabilities field means unknown, not unsupported
-    p = p.then(caps => { if (caps.length > 0) modelCapabilityCache.set(model, Promise.resolve(caps)); return caps })
+    p = fetchModelInfo(model)
+    p = p.then(info => {
+      if (info.capabilities.length > 0 || info.contextLength > 0)
+        modelInfoCache.set(model, Promise.resolve(info))
+      return info
+    })
   }
   return p
+}
+
+/** Capabilities for a model (cached). */
+async function ollamaCapabilities(model: string): Promise<string[]> {
+  return (await ollamaModelInfo(model)).capabilities
 }
 
 interface StreamCallbacks {
@@ -108,23 +129,32 @@ async function ollamaChatRaw(
   format: unknown,
   think: boolean,
   signal?: AbortSignal,
+  nativeCtxLength = 0,  // from model_info; 0 = unknown
 ): Promise<Message> {
-  // Strip thinking field from history messages before sending — Qwen3 best-practice:
-  // "historical model output should only include the final output part and does not
-  // need to include the thinking content." Avoids wasting context on re-sent traces.
   const serializedMessages = messages.map(m =>
     m.thinking ? { ...m, thinking: undefined } : m
   )
   const body: Record<string, unknown> = { model, messages: serializedMessages, tools, stream: true }
   if (think) {
     body.think = true
-    // num_ctx must cover BOTH input tokens AND output tokens.
-    // COMPACT_THRESHOLD (~32000 est. tokens) is the max input size before
-    // compaction fires. Qwen3 needs up to 32,768 output tokens for its think
-    // block. Setting num_ctx = 32768 leaves ~768 tokens for generation —
-    // essentially nothing. Use at least COMPACT_THRESHOLD + 32768 ≈ 65536.
-    // Override via SPARK_NUM_CTX env var.
-    const numCtx = Number(process.env.SPARK_NUM_CTX) || 65536
+    // num_ctx must cover both input and output. Use the model's native context
+    // length (from /api/show model_info) capped to a sane max, then ensure
+    // we leave at least 32768 tokens for the think block + response.
+    // SPARK_NUM_CTX overrides everything.
+    const envCtx = Number(process.env.SPARK_NUM_CTX) || 0
+    const THINK_OUTPUT_RESERVE = 32768  // tokens reserved for think + response
+    const MAX_CTX = 131072              // cap: 128k is enough for any current model
+    let numCtx: number
+    if (envCtx > 0) {
+      numCtx = envCtx
+    } else if (nativeCtxLength > 0) {
+      // Use the model's native limit, but cap to MAX_CTX to avoid OOM
+      numCtx = Math.min(nativeCtxLength, MAX_CTX)
+    } else {
+      // Unknown model — safe fallback: 32000 est. input tokens (COMPACT_THRESHOLD)
+      // × 4 chars/token + 32768 output reserve ≈ 160768
+      numCtx = 32000 * 4 + THINK_OUTPUT_RESERVE
+    }
     // Qwen3 recommended sampling for thinking mode: DO NOT use greedy (temp=0).
     body.options = { num_ctx: numCtx, temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0 }
   }
@@ -213,17 +243,18 @@ export async function ollamaChat(
   signal?: AbortSignal,
   forceThink?: boolean,
 ): Promise<Message> {
-  const caps = await ollamaCapabilities(model)
+  const info = await ollamaModelInfo(model)
+  const caps = info.capabilities
   const think = forceThink !== undefined
     ? (forceThink && caps.includes("thinking"))
     : (!format && caps.includes("thinking"))
   try {
-    return await ollamaChatRaw(model, messages, tools, callbacks, format, think, signal)
+    return await ollamaChatRaw(model, messages, tools, callbacks, format, think, signal, info.contextLength)
   } catch (e) {
     // If the model reported thinking support but rejects think:true, evict and retry once
     if (think && String(e).includes("400")) {
-      modelCapabilityCache.delete(model)
-      return ollamaChatRaw(model, messages, tools, callbacks, format, false, signal)
+      modelInfoCache.delete(model)
+      return ollamaChatRaw(model, messages, tools, callbacks, format, false, signal, 0)
     }
     throw e
   }
