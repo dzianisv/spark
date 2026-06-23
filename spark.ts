@@ -101,12 +101,13 @@ async function fetchModelInfo(model: string): Promise<ModelInfo> {
 function ollamaModelInfo(model: string): Promise<ModelInfo> {
   let p = modelInfoCache.get(model)
   if (!p) {
-    p = fetchModelInfo(model)
-    p = p.then(info => {
-      if (info.capabilities.length > 0 || info.contextLength > 0)
-        modelInfoCache.set(model, Promise.resolve(info))
+    // Store the promise synchronously so concurrent cold calls share the same fetch.
+    p = fetchModelInfo(model).then(info => {
+      if (info.capabilities.length === 0 && info.contextLength === 0)
+        modelInfoCache.delete(model)  // don't cache failures — allow retry
       return info
     })
+    modelInfoCache.set(model, p)
   }
   return p
 }
@@ -296,8 +297,11 @@ function modelParamSize(name: string): number {
 }
 
 function pickBestModel(models: string[]): string {
+  // Filter out non-chat models (embedding-only, etc.) — they'd fail /api/chat immediately.
+  const chatModels = models.filter(m => !m.toLowerCase().includes("embed"))
+  const pool = chatModels.length > 0 ? chatModels : models  // fallback if only embeddings
   // Sort by: 1) model family score (desc), 2) param size (desc, bigger = smarter)
-  return [...models].sort((a, b) => {
+  return [...pool].sort((a, b) => {
     const scoreDiff = modelScore(b) - modelScore(a)
     if (scoreDiff !== 0) return scoreDiff
     return modelParamSize(b) - modelParamSize(a)
@@ -2228,6 +2232,11 @@ async function main() {
   let phasedAutopilot = false
 
   printHeader(currentModel, skillMap.size)
+
+  // Announce restored goal after header so user knows why the supervisor may kick in
+  if (goal) {
+    console.log(`${COLORS.dim}Restored goal: ${goal}  (use /goal clear to remove)${COLORS.reset}\n`)
+  }
 
   // 7. REPL loop
   const isTTY = process.stdin.isTTY ?? false
