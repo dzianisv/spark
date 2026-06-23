@@ -1,39 +1,105 @@
 #!/bin/sh
+# spark sandbox — self-contained, no repo clone needed.
+# Usage:
+#   chmod +x sandbox && ./sandbox                              # Ollama backend
+#   CHATGPT_ACCESS_TOKEN=eyJ... ./sandbox                      # ChatGPT via Aurora
+#   SPARK_DIR=/path/to/spark ./sandbox                         # explicit spark location
+#
+# Env vars:
+#   SPARK_DIR              path to spark.ts (default: directory of this script)
+#   OLLAMA_URL             Ollama server (default: http://localhost:11434)
+#   CHATGPT_ACCESS_TOKEN   ChatGPT session token — starts Aurora proxy inside container
+#   SPARK_API_URL          explicit OpenAI-compat API endpoint (skips Aurora auto-start)
+#   SPARK_API_KEY          API key for SPARK_API_URL
+
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMAGE="spark-sandbox"
+SPARK_DIR="${SPARK_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 
-# Build only if image doesn't exist locally
+# ── Embedded Dockerfile ───────────────────────────────────────────────────────
+build_image() {
+  TMPDIR="$(mktemp -d)"
+  trap 'rm -rf "$TMPDIR"' EXIT
+
+  cat > "$TMPDIR/Dockerfile" << 'DOCKERFILE'
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    curl git ca-certificates unzip xz-utils \
+    build-essential procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 22 + npm
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bun
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:$PATH"
+
+# Go 1.24
+RUN curl -fsSL https://go.dev/dl/go1.24.4.linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz \
+    | tar -C /usr/local -xz
+ENV PATH="/usr/local/go/bin:/root/go/bin:$PATH"
+ENV GOPATH=/root/go
+
+# Aurora (ChatGPT → OpenAI-compat proxy) — built at image time, instant at runtime
+RUN go install github.com/aurora-develop/aurora@latest
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+WORKDIR /workspace
+ENTRYPOINT ["/entrypoint.sh"]
+DOCKERFILE
+
+  cat > "$TMPDIR/entrypoint.sh" << 'ENTRYPOINT'
+#!/bin/sh
+set -e
+if [ -n "$CHATGPT_ACCESS_TOKEN" ]; then
+  mkdir -p "$HOME/.aurora"
+  echo "$CHATGPT_ACCESS_TOKEN" > "$HOME/.aurora/access_tokens.txt"
+  aurora &
+  i=0
+  until curl -sf http://localhost:8080/v1/models > /dev/null 2>&1; do
+    i=$((i+1))
+    [ $i -ge 60 ] && echo "[sandbox] Aurora failed to start" >&2 && break
+    sleep 0.5
+  done
+  echo "[sandbox] Aurora ready at http://localhost:8080"
+  export SPARK_API_URL=http://localhost:8080
+  export SPARK_API_KEY=$CHATGPT_ACCESS_TOKEN
+fi
+exec "$@"
+ENTRYPOINT
+
+  echo "[sandbox] Building $IMAGE (first time ~3 min, cached after)..."
+  docker build -t "$IMAGE" "$TMPDIR"
+}
+
+# ── Build image if not cached ─────────────────────────────────────────────────
 if ! docker image inspect "$IMAGE" > /dev/null 2>&1; then
-  echo "[sandbox] Building $IMAGE (first time, may take a few minutes)..."
-  docker build -t "$IMAGE" "$SCRIPT_DIR"
+  build_image
 else
-  echo "[sandbox] Using cached $IMAGE image (run 'docker rmi $IMAGE' to rebuild)"
+  echo "[sandbox] Using cached $IMAGE  (run 'docker rmi $IMAGE' to rebuild)"
 fi
 
-# Spark script location
-SPARK_DIR="$(dirname "$SCRIPT_DIR")"
-
-# Rewrite localhost → host.docker.internal for Docker networking
+# ── Docker run args ───────────────────────────────────────────────────────────
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 DOCKER_OLLAMA_URL="$(echo "$OLLAMA_URL" | sed 's/localhost/host.docker.internal/g; s/127\.0\.0\.1/host.docker.internal/g')"
 
-# Build volume mounts
-VOL_ARGS="-v $(pwd):/workspace -v $SPARK_DIR:/spark"
-
-# Spark entry point
-SPARK_CMD="bun /spark/spark.ts"
-
-# Extra env vars
 EXTRA_ENV="-e OLLAMA_URL=$DOCKER_OLLAMA_URL -e SPARK_SANDBOX=1"
 [ -n "$CHATGPT_ACCESS_TOKEN" ] && EXTRA_ENV="$EXTRA_ENV -e CHATGPT_ACCESS_TOKEN=$CHATGPT_ACCESS_TOKEN"
-[ -n "$SPARK_API_URL" ] && EXTRA_ENV="$EXTRA_ENV -e SPARK_API_URL=$SPARK_API_URL -e SPARK_API_KEY=${SPARK_API_KEY:-}"
+[ -n "$SPARK_API_URL" ]        && EXTRA_ENV="$EXTRA_ENV -e SPARK_API_URL=$SPARK_API_URL -e SPARK_API_KEY=${SPARK_API_KEY:-}"
 
 # shellcheck disable=SC2086
 exec docker run --rm -it \
   --add-host=host.docker.internal:host-gateway \
   $EXTRA_ENV \
-  $VOL_ARGS \
+  -v "$(pwd):/workspace" \
+  -v "$SPARK_DIR:/spark" \
   -w /workspace \
-  "$IMAGE" $SPARK_CMD
+  "$IMAGE" bun /spark/spark.ts
+
