@@ -1,0 +1,37 @@
+#!/bin/sh
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Build image (Docker layer cache = fast on subsequent runs)
+echo "[sandbox] Building spark-sandbox image..."
+docker build -t spark-sandbox "$SCRIPT_DIR"
+
+# Rewrite localhost in OLLAMA_URL for Docker networking
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+DOCKER_OLLAMA_URL="$(echo "$OLLAMA_URL" | sed 's/localhost/host.docker.internal/g; s/127\.0\.0\.1/host.docker.internal/g')"
+
+# Build docker run args
+DOCKER_ARGS="-it --rm"
+DOCKER_ARGS="$DOCKER_ARGS --add-host=host.docker.internal:host-gateway"
+DOCKER_ARGS="$DOCKER_ARGS -e OLLAMA_URL=$DOCKER_OLLAMA_URL"
+DOCKER_ARGS="$DOCKER_ARGS -e SPARK_SANDBOX=1"
+DOCKER_ARGS="$DOCKER_ARGS -v $(pwd):/workspace"
+DOCKER_ARGS="$DOCKER_ARGS -w /workspace"
+
+# Mount spark.ts dir if outside cwd
+if [ "$SCRIPT_DIR" != "$(pwd)" ]; then
+  DOCKER_ARGS="$DOCKER_ARGS -v $SCRIPT_DIR:/spark"
+  SPARK_CMD="bun /spark/spark.ts"
+else
+  SPARK_CMD="bun /workspace/spark.ts"
+fi
+
+# Optional: ChatGPT token (Aurora starts inside container)
+[ -n "$CHATGPT_ACCESS_TOKEN" ] && DOCKER_ARGS="$DOCKER_ARGS -e CHATGPT_ACCESS_TOKEN=$CHATGPT_ACCESS_TOKEN"
+# Optional: explicit OpenAI-compat backend
+[ -n "$SPARK_API_URL" ] && DOCKER_ARGS="$DOCKER_ARGS -e SPARK_API_URL=$SPARK_API_URL -e SPARK_API_KEY=${SPARK_API_KEY:-}"
+
+echo "[sandbox] Starting container..."
+# shellcheck disable=SC2086
+exec docker run $DOCKER_ARGS spark-sandbox $SPARK_CMD

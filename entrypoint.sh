@@ -8,7 +8,6 @@ if [ -n "$CHATGPT_ACCESS_TOKEN" ] && [ -z "$SPARK_API_URL" ]; then
 
   # Start Aurora in background
   aurora &
-  AURORA_PID=$!
 
   # Wait up to 15s for Aurora to be ready (30 x 0.5s)
   i=0

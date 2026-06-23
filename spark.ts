@@ -1809,14 +1809,13 @@ async function spawnSandbox(): Promise<void> {
     containerScript = `/spark/${basename(scriptPath)}`
   }
 
-  // Use spark-local image (has Aurora) if built; fall back to plain bun image.
-  const localImage = "spark-local"
+  // Use spark-sandbox image (Bun+Node+Go+Aurora); fall back to plain bun if not yet built.
   const useLocalImage = await new Promise<boolean>(res => {
-    const p = spawn("docker", ["image", "inspect", localImage], { stdio: "ignore" })
+    const p = spawn("docker", ["image", "inspect", "spark-sandbox"], { stdio: "ignore" })
     p.on("close", code => res(code === 0))
     p.on("error", () => res(false))
   })
-  const image = useLocalImage ? localImage : "oven/bun:alpine"
+  const image = useLocalImage ? "spark-sandbox" : "oven/bun:alpine"
 
   // Pass CHATGPT_ACCESS_TOKEN so Aurora can start inside the container.
   const tokenEnv = process.env.CHATGPT_ACCESS_TOKEN
