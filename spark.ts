@@ -671,7 +671,7 @@ function makeEval(): Tool {
       function: {
         name: "Eval",
         description:
-          "Evaluate JavaScript or TypeScript code inside the agent process (Bun runtime). Returns the result of the last expression, or console output. Use for quick calculations, data transforms, or testing snippets.",
+          "Evaluate JavaScript or TypeScript code in an isolated Bun subprocess. Returns the result of the last expression, or console output. Use for quick calculations, data transforms, or testing snippets.",
         parameters: {
           type: "object",
           properties: {
@@ -684,25 +684,31 @@ function makeEval(): Tool {
     },
     async execute(args) {
       const code = String(args.code)
-      const logs: string[] = []
-      const fakeConsole = {
-        log: (...a: unknown[]) => logs.push(a.map(String).join(" ")),
-        error: (...a: unknown[]) => logs.push("[stderr] " + a.map(String).join(" ")),
-        warn: (...a: unknown[]) => logs.push("[warn] " + a.map(String).join(" ")),
-        info: (...a: unknown[]) => logs.push(a.map(String).join(" ")),
-      }
-      try {
-        const transpiler = new Bun.Transpiler({ loader: "ts" })
-        const js = transpiler.transformSync(code)
-        const fn = new Function("console", `return (async () => { ${js} })()`)
-        const result = await fn(fakeConsole)
-        const output = logs.length ? logs.join("\n") + "\n" : ""
-        const resultStr = result !== undefined ? String(result) : ""
-        return (output + resultStr).trim() || "(no output)"
-      } catch (err: unknown) {
-        const output = logs.length ? logs.join("\n") + "\n" : ""
-        return output + `Error: ${err instanceof Error ? err.message : String(err)}`
-      }
+      // Run in a child process so process.exit() / infinite loops can't kill the REPL.
+      // Wrap in an IIFE that prints the return value so the agent sees the result.
+      const wrapped = `const __r = await (async()=>{ ${code} })(); if (__r !== undefined) console.log(__r)`
+      return new Promise<string>((done) => {
+        const proc = Bun.spawn(["bun", "--eval", wrapped], {
+          cwd: process.cwd(),
+          stdout: "pipe",
+          stderr: "pipe",
+          env: process.env,
+        })
+        const chunks: Buffer[] = []
+        const errChunks: Buffer[] = []
+        proc.stdout.on("data", (d: Buffer) => chunks.push(d))
+        proc.stderr.on("data", (d: Buffer) => errChunks.push(d))
+        const TIMEOUT_MS = 30_000
+        const timer = setTimeout(() => { proc.kill(); done("Error: Eval timed out after 30s") }, TIMEOUT_MS)
+        proc.on("close", (code: number | null) => {
+          clearTimeout(timer)
+          const out = Buffer.concat(chunks).toString("utf-8").trim()
+          const err = Buffer.concat(errChunks).toString("utf-8").trim()
+          if (code !== 0 && err) done(`Error: ${err}`)
+          else done(out || "(no output)")
+        })
+        proc.on("error", (err: Error) => { clearTimeout(timer); done(`Error spawning eval: ${err.message}`) })
+      })
     },
   }
 }
@@ -2223,11 +2229,17 @@ async function main() {
   }
 
   // 6. Init conversation
+  // baseSystemPrompt never contains the goal block — goal is appended dynamically.
+  // This avoids the fragile regex-strip approach: a user's AGENTS.md containing
+  // "## GOAL (mandatory" would match the strip regex and corrupt the system prompt.
+  const baseSystemPrompt = systemPrompt
+  const setGoalBlock = (g: string | null) => {
+    messages[0].content = baseSystemPrompt + (g ? buildGoalBlock(g) : "")
+  }
+
   const messages: Message[] = [{ role: "system", content: systemPrompt }]
   let goal: string | null = await loadGoal()
-  if (goal) {
-    messages[0].content += buildGoalBlock(goal)
-  }
+  if (goal) setGoalBlock(goal)
   let autopilot = false
   let phasedAutopilot = false
 
@@ -2389,17 +2401,13 @@ async function main() {
       if (arg === "clear") {
         goal = null
         await clearGoal()
-        // Strip MANDATORY goal block from system prompt (block is always appended
-        // last via +=, so the greedy [\s\S]*$ match reliably removes it)
-        messages[0].content = messages[0].content.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
+        setGoalBlock(null)
         console.log(`goal cleared`)
       } else {
         goal = arg
         await saveGoal(arg)
         console.log(`goal set: ${arg}`)
-        // Replace any existing goal block, then append new one
-        messages[0].content = messages[0].content.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
-        messages[0].content += buildGoalBlock(arg)
+        setGoalBlock(arg)
         messages.push({ role: "user", content: `My current goal: ${arg}\n\nThis goal is mandatory — I need you to work toward it and provide evidence when it is achieved.` })
       }
       continue
@@ -2531,9 +2539,7 @@ Start with PHASE 1 now.`
         goal = derived
         await saveGoal(derived)
 
-        // Inject MANDATORY goal block into system prompt
-        messages[0].content = messages[0].content.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
-        messages[0].content += buildGoalBlock(derived)
+        setGoalBlock(derived)
 
         const objectiveN = (await loadAutopilotCount()) + 1
         await saveAutopilotCount(objectiveN)
