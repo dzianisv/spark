@@ -118,9 +118,13 @@ async function ollamaChatRaw(
   const body: Record<string, unknown> = { model, messages: serializedMessages, tools, stream: true }
   if (think) {
     body.think = true
-    // num_ctx: Qwen3 needs 32,768+ tokens of output room for its think block.
-    // Ollama's default is 2048 which silently truncates reasoning mid-thought.
-    const numCtx = Number(process.env.SPARK_NUM_CTX) || 32768
+    // num_ctx must cover BOTH input tokens AND output tokens.
+    // COMPACT_THRESHOLD (~32000 est. tokens) is the max input size before
+    // compaction fires. Qwen3 needs up to 32,768 output tokens for its think
+    // block. Setting num_ctx = 32768 leaves ~768 tokens for generation —
+    // essentially nothing. Use at least COMPACT_THRESHOLD + 32768 ≈ 65536.
+    // Override via SPARK_NUM_CTX env var.
+    const numCtx = Number(process.env.SPARK_NUM_CTX) || 65536
     // Qwen3 recommended sampling for thinking mode: DO NOT use greedy (temp=0).
     body.options = { num_ctx: numCtx, temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0 }
   }
@@ -1696,6 +1700,13 @@ function buildSystemPrompt(agentInstructions: string, skillList: string, model: 
 - If a task requires multiple independent tool calls, make them all at once.
 - Verify your work — run the code, check the output, confirm it works.
 - After patching code, call RunTests to verify correctness before declaring done.
+
+## Reasoning
+Before writing code or making decisions, think through the problem:
+- Identify the root cause, not just the symptom
+- Consider at least two approaches and evaluate trade-offs
+- Check for edge cases and failure modes before committing to a solution
+- Verify your reasoning matches what the code actually does, not what you expect it to do
 
 ## Available Skills
 Use LoadSkill to read a skill's full instructions when a task matches.
