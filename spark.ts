@@ -2243,6 +2243,8 @@ async function main() {
   if (goal) setGoalBlock(goal)
   let autopilot = false
   let phasedAutopilot = false
+  let alwaysAutopilot = true
+  let goalIsExplicit = false
 
   printHeader(currentModel, skillMap.size)
 
@@ -2401,11 +2403,13 @@ async function main() {
       const arg = trimmed.slice("/goal ".length).trim()
       if (arg === "clear") {
         goal = null
+        goalIsExplicit = false
         await clearGoal()
         setGoalBlock(null)
         console.log(`goal cleared`)
       } else {
         goal = arg
+        goalIsExplicit = true
         await saveGoal(arg)
         console.log(`goal set: ${arg}`)
         setGoalBlock(arg)
@@ -2523,6 +2527,7 @@ Start with PHASE 1 now.`
       if (arg === "off") {
         autopilot = false
         phasedAutopilot = false
+        alwaysAutopilot = false
         console.log(`autopilot OFF`)
         continue
       }
@@ -2531,6 +2536,7 @@ Start with PHASE 1 now.`
         const isPhased = arg.startsWith("--phased ")
         autopilot = true
         phasedAutopilot = isPhased
+        alwaysAutopilot = true
         skipGenericPush = true
 
         // Include any inline task arg as staging context for goal derivation,
@@ -2567,6 +2573,29 @@ Start with PHASE 1 now.`
         process.stdout.write("                              \r")
         console.log(`⚠ /autopilot failed: ${err instanceof Error ? err.message : String(err)}`)
         continue
+      }
+    }
+
+    // Always-autopilot: derive goal from user message if none is set
+    if (alwaysAutopilot && !skipGenericPush) {
+      autopilot = true
+      if (!goal) {
+        // Derive goal from this user message in a subagent call
+        const stagingMessages: Message[] = [...messages, { role: "user", content: trimmed }]
+        process.stdout.write(`${COLORS.dim}deriving goal…${COLORS.reset}\r`)
+        try {
+          const derived = await deriveGoal(currentModel, stagingMessages, null)
+          if (derived) {
+            goal = derived
+            await saveGoal(derived)
+            setGoalBlock(derived)
+            const preview = derived.length > 80 ? derived.slice(0, 80) + "…" : derived
+            process.stdout.write("                              \r")
+            console.log(`${COLORS.dim}goal: ${preview}${COLORS.reset}`)
+          }
+        } catch {
+          process.stdout.write("                              \r")
+        }
       }
     }
 
@@ -2845,6 +2874,12 @@ Start with PHASE 1 now.`
 
     autopilot = false
     phasedAutopilot = false
+    // Re-arm autopilot for the next turn; clear derived goal so next message gets a fresh one
+    if (alwaysAutopilot && !goalIsExplicit) {
+      goal = null
+      await clearGoal()
+      setGoalBlock(null)
+    }
     process.off("SIGINT", sigintHandler)
     if (isTTY) {
       try { process.stdin.setRawMode(false) } catch {}
