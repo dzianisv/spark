@@ -151,14 +151,14 @@ async function ollamaChatRaw(
       // Use the model's native limit, but cap to MAX_CTX to avoid OOM
       numCtx = Math.min(nativeCtxLength, MAX_CTX)
     } else {
-      // Unknown model — safe fallback: 32000 est. input tokens (COMPACT_THRESHOLD)
-      // × 4 chars/token + 32768 output reserve ≈ 160768
-      numCtx = 32000 * 4 + THINK_OUTPUT_RESERVE
+      // Unknown model — safe fallback: input budget (COMPACT_THRESHOLD tokens)
+      // + output reserve. No * 4: COMPACT_THRESHOLD is already in tokens.
+      numCtx = Math.min(32000 + THINK_OUTPUT_RESERVE, MAX_CTX)
     }
     // Qwen3 recommended sampling for thinking mode: DO NOT use greedy (temp=0).
     body.options = { num_ctx: numCtx, temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0 }
   }
-  if (format) { body.format = format; body.options = { temperature: 0 } }
+  if (format && !think) { body.format = format; body.options = { temperature: 0 } }
   const res = await fetch(`${getOllamaUrl()}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -381,6 +381,7 @@ export async function compactMessages(model: string, messages: Message[], signal
     undefined,
     undefined,
     signal,
+    false,  // compaction is plain summarisation — no thinking needed
   )
   const summary = reply.content
   if (signal?.aborted || !summary.trim()) return false
@@ -2063,7 +2064,7 @@ export async function deriveGoal(
   const reply = await ollamaChat(
     model,
     [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
-    [], undefined, undefined, signal,
+    [], undefined, undefined, signal, false,  // goal derivation — no thinking
   )
 
   const derived = (reply.content ?? "").trim().slice(0, 300)
