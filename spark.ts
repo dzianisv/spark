@@ -703,7 +703,8 @@ function makeEval(): Tool {
           clearTimeout(timer)
           const out = Buffer.concat(chunks).toString("utf-8").trim()
           const err = Buffer.concat(errChunks).toString("utf-8").trim()
-          if (code !== 0 && err) done(`Error: ${err}`)
+          if (code !== 0) done(`Error (exit ${code ?? "killed"}): ${err || out || "(no output)"}`)
+          else if (err) done(out ? `${out}\n[stderr] ${err}` : `[stderr] ${err}`)
           else done(out || "(no output)")
         })
         proc.on("error", (err: Error) => { clearTimeout(timer); done(`Error spawning eval: ${err.message}`) })
@@ -821,7 +822,8 @@ function makeRunTests(): Tool {
       // Build spawn args arrays to avoid shell injection
       let spawnCmd: string[]
       if (pkgContent) {
-        const pkg = JSON.parse(pkgContent).scripts ?? {}
+        let pkg: Record<string, string> = {}
+        try { pkg = JSON.parse(pkgContent).scripts ?? {} } catch { /* malformed package.json — fall through to bun test */ }
         if (hasBunLockb || pkgContent.includes('"bun"')) {
           spawnCmd = filter ? ["bun", "test", filter] : ["bun", "test"]
           cmd = filter ? `bun test ${filter}` : "bun test"
@@ -2481,6 +2483,11 @@ async function main() {
       if (!issueDesc) { console.log(`Usage: /repro <issue description>`); continue }
 
       autopilot = true
+      // Set a concrete goal so the supervisor judges this run correctly,
+      // not against any stale goal from a previous /goal or /autopilot.
+      goal = `Issue reproduced by a failing script, root cause fixed, repro script now passes, and RunTests passes. Issue: ${issueDesc}`
+      await saveGoal(goal)
+      setGoalBlock(goal)
       const reproPrompt = `You are in issue-reproduce-fix-verify mode for this issue:
 
 ISSUE: ${issueDesc}
