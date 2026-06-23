@@ -968,110 +968,6 @@ function makeGrep(): Tool {
   }
 }
 
-function makeRunTests(): Tool {
-  return {
-    definition: {
-      type: "function",
-      function: {
-        name: "RunTests",
-        description: "Auto-detect and run the project's test suite. Detects bun test, jest, pytest, go test, cargo test. Use after patching to verify correctness. Optionally filter by file or pattern.",
-        parameters: {
-          type: "object",
-          properties: {
-            filter: { type: "string", description: "Test file path or pattern to run (optional — runs all tests if omitted)" },
-            workdir: { type: "string", description: "Directory to run tests in (default: cwd)" },
-          },
-          required: [],
-          additionalProperties: false,
-        },
-      },
-    },
-    async execute(args) {
-      const workdir = resolve(String(args.workdir ?? process.cwd()))
-      const filter = args.filter ? String(args.filter) : null
-
-      // Detect test runner
-      let cmd: string
-      const pkgPath = join(workdir, "package.json")
-      const pkgContent = await readFile(pkgPath, "utf-8").catch(() => null)
-      const hasBunLockb = await stat(join(workdir, "bun.lockb")).then(() => true).catch(() => false)
-      const hasPytest = await stat(join(workdir, "pytest.ini")).then(() => true).catch(() =>
-        stat(join(workdir, "pyproject.toml")).then(() => true).catch(() =>
-        stat(join(workdir, "setup.py")).then(() => true).catch(() => false)))
-      const hasGoMod = await stat(join(workdir, "go.mod")).then(() => true).catch(() => false)
-      const hasCargoToml = await stat(join(workdir, "Cargo.toml")).then(() => true).catch(() => false)
-
-      // Build spawn args arrays to avoid shell injection
-      let spawnCmd: string[]
-      if (pkgContent) {
-        let pkg: Record<string, string> = {}
-        try { pkg = JSON.parse(pkgContent).scripts ?? {} } catch { /* malformed package.json — fall through to bun test */ }
-        if (hasBunLockb || pkgContent.includes('"bun"')) {
-          spawnCmd = filter ? ["bun", "test", filter] : ["bun", "test"]
-          cmd = filter ? `bun test ${filter}` : "bun test"
-        } else if (pkg.test?.includes("jest") || pkgContent.includes('"jest"')) {
-          spawnCmd = filter ? ["npx", "jest", filter] : ["npx", "jest"]
-          cmd = filter ? `npx jest ${filter}` : "npx jest"
-        } else if (pkg.test) {
-          spawnCmd = filter ? ["npm", "test", "--", filter] : ["npm", "test"]
-          cmd = filter ? `npm test -- ${filter}` : "npm test"
-        } else {
-          spawnCmd = filter ? ["bun", "test", filter] : ["bun", "test"]
-          cmd = filter ? `bun test ${filter}` : "bun test"
-        }
-      } else if (hasPytest) {
-        spawnCmd = filter ? ["python", "-m", "pytest", filter, "-v"] : ["python", "-m", "pytest", "-v"]
-        cmd = filter ? `python -m pytest ${filter} -v` : "python -m pytest -v"
-      } else if (hasGoMod) {
-        spawnCmd = filter ? ["go", "test", "./...", "-run", filter] : ["go", "test", "./..."]
-        cmd = filter ? `go test ./... -run ${filter}` : "go test ./..."
-      } else if (hasCargoToml) {
-        spawnCmd = filter ? ["cargo", "test", filter] : ["cargo", "test"]
-        cmd = filter ? `cargo test ${filter}` : "cargo test"
-      } else {
-        spawnCmd = filter ? ["bun", "test", filter] : ["bun", "test"]
-        cmd = filter ? `bun test ${filter}` : "bun test"
-      }
-
-      return new Promise<string>((done) => {
-        const chunks: Buffer[] = []
-        const proc = spawn(spawnCmd[0], spawnCmd.slice(1), {
-          cwd: workdir,
-          stdio: ["ignore", "pipe", "pipe"],
-          env: { ...process.env },
-        })
-        proc.stdout.on("data", (d: Buffer) => chunks.push(d))
-        proc.stderr.on("data", (d: Buffer) => chunks.push(d))
-        const timer = setTimeout(() => { proc.kill("SIGTERM"); setTimeout(() => proc.kill("SIGKILL"), 3000) }, 120_000)
-        proc.on("close", (code) => {
-          clearTimeout(timer)
-          const raw = Buffer.concat(chunks).toString("utf-8")
-          // Truncate to 150 lines
-          const lines = raw.split("\n")
-          const truncated = lines.length > 150
-            ? lines.slice(0, 150).join("\n") + `\n[...${lines.length - 150} lines omitted]`
-            : raw
-          const noTestsMarkers = [
-            "no test files",      // go
-            "0 tests",            // bun/jest summary lines
-            "no tests ran",       // jest --passWithNoTests
-            "no tests found",     // pytest with no match
-            "collected 0 items",  // pytest
-            "test suite: 0",      // jest
-          ]
-          const hasNoTests = noTestsMarkers.some(m => raw.toLowerCase().includes(m))
-          const label =
-            code === 5 ? "[NO TESTS RAN]"  // pytest: no tests collected
-            : code !== 0 ? `[TESTS FAILED — exit code: ${code}]`
-            : hasNoTests ? "[NO TESTS RAN]"
-            : "[TESTS PASSED]"
-          done(label + `\nCommand: ${cmd}\n\n` + truncated)
-        })
-        proc.on("error", (err) => done(`Error running tests: ${err.message}\nCommand: ${cmd}`))
-      })
-    },
-  }
-}
 
 function makeListSymbols(): Tool {
   return {
@@ -2428,10 +2324,9 @@ async function main() {
   const globTool = makeGlob()
   const grepTool = makeGrep()
   const loadSkillTool = makeLoadSkill(skillMap)
-  const runTestsTool = makeRunTests()
   const listSymbolsTool = makeListSymbols()
   const findSymbolTool = makeFindSymbol()
-  const coreTools = [readFileTool, writeFileTool, bashTool, evalTool, globTool, grepTool, runTestsTool, listSymbolsTool, findSymbolTool, loadSkillTool]
+  const coreTools = [readFileTool, writeFileTool, bashTool, evalTool, globTool, grepTool, listSymbolsTool, findSymbolTool, loadSkillTool]
 
   // 4. Build system prompt
   const systemPrompt = buildSystemPrompt(agentInstructions, skillList, currentModel, gitContext)
