@@ -2502,15 +2502,22 @@ Start with PHASE 1 now.`
 
     // Per-turn abort controller — Esc/Ctrl+C aborts and returns to prompt; Ctrl+Q exits
     let turnAbort = new AbortController()
+    // Also abort all running sub-agents so TaskWait unblocks immediately.
+    const abortTurn = () => {
+      turnAbort.abort()
+      for (const h of taskRegistry.values()) {
+        if (h.status === "running") { h.cancelReason ??= "User interrupted"; h.abort.abort() }
+      }
+    }
     const sigintHandler = () => {
       process.stdout.write(`\n${COLORS.yellow}⚡ Interrupted${COLORS.reset}\n`)
-      turnAbort.abort()
+      abortTurn()
     }
     const keypressHandler = (_: unknown, key: { name?: string; ctrl?: boolean } | undefined) => {
       if (!key) return
       if (key.name === "escape" || (key.ctrl && key.name === "c")) {
         process.stdout.write(`\n${COLORS.yellow}⚡ Interrupted${COLORS.reset}\n`)
-        turnAbort.abort()
+        abortTurn()
       } else if (key.ctrl && key.name === "q") {
         process.stdout.write(`\n${COLORS.dim}Bye!${COLORS.reset}\n`)
         rl.close()
@@ -2670,7 +2677,13 @@ Start with PHASE 1 now.`
               recentToolCalls.length = 0
             }
           }
-          if (turnAbort.signal.aborted) break
+          if (turnAbort.signal.aborted) {
+            // Strip the assistant tool_calls message if we never pushed matching tool results —
+            // an unanswered tool_calls entry confuses the model on the next turn.
+            const last = messages[messages.length - 1]
+            if (last?.role === "assistant" && last.tool_calls?.length) messages.pop()
+            break
+          }
           if (autopilotState.exited && !autopilotState.summarized) {
             autopilotState.summarized = true
             autopilot = false // exit returns to normal mode (blog: switch to build); re-arm with /autopilot
