@@ -189,21 +189,6 @@ const TOOL_DEFS: ToolDef[] = [
   {
     type: "function",
     function: {
-      name: "RunTests",
-      description: "Auto-detect and run the project's test suite. Use after patching to verify correctness.",
-      parameters: {
-        type: "object",
-        properties: {
-          filter: { type: "string", description: "Test file path or pattern (optional)" },
-          workdir: { type: "string", description: "Directory to run tests in (default: cwd)" },
-        },
-        required: [],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "ListSymbols",
       description: "List top-level symbols (functions, classes, constants) in a file with line numbers.",
       parameters: {
@@ -309,8 +294,6 @@ async function executeToolCall(name: string, args: Record<string, unknown>): Pro
         return `Error: ${err instanceof Error ? err.message : String(err)}`
       }
     }
-    case "RunTests":
-      return `[TESTS PASSED]\nCommand: bun test\n\nbun test v1.3.14\n 3 pass\n 0 fail\nRan 3 tests. [1234ms]`
     case "ListSymbols": {
       const filePath = resolve(String(args.filePath))
       const content = await readFile(filePath, "utf-8").catch(() => null)
@@ -638,15 +621,15 @@ describe("spark agent G-Eval", () => {
     expect(score.task_completion).toBeGreaterThanOrEqual(2)
   }, TIMEOUT)
 
-  test("RunTests — verify after patch", async () => {
+  test("Bash — run tests after patch", async () => {
     const trace = await runAgent(agentModel,
       "I just patched auth.ts to fix the login bug. Run the tests to verify the fix.")
 
     const score = await judge(judgeModel,
-      "User asked agent to run tests after a patch. Agent should use RunTests tool.",
-      "RunTests", trace)
+      "User asked agent to run tests after a patch. Agent should use Bash to run the test suite (e.g. bun test, npm test, or similar).",
+      "Bash", trace)
 
-    console.log(`  RunTests scores: sel=${score.tool_selection} usage=${score.tool_usage} task=${score.task_completion}`)
+    console.log(`  Bash-run-tests scores: sel=${score.tool_selection} usage=${score.tool_usage} task=${score.task_completion}`)
     console.log(`  Reasoning: ${score.reasoning}`)
 
     expect(score.tool_selection).toBeGreaterThanOrEqual(3)
