@@ -2230,13 +2230,19 @@ async function main() {
 
     if (trimmed === "/clear") {
       messages.length = 1 // keep system prompt
+      autopilot = false
+      phasedAutopilot = false
       console.log(`${COLORS.dim}Conversation cleared.${COLORS.reset}\n`)
       continue
     }
 
     if (trimmed === "/models") {
-      const freshModels = await ollamaModels()
-      currentModel = await selectModel(freshModels, currentModel, rl)
+      try {
+        const freshModels = await ollamaModels()
+        currentModel = await selectModel(freshModels, currentModel, rl)
+      } catch (err: unknown) {
+        console.log(`⚠ /models failed: ${err instanceof Error ? err.message : String(err)}`)
+      }
       continue
     }
 
@@ -2420,41 +2426,49 @@ Start with PHASE 1 now.`
         continue
       }
 
-      const isPhased = arg.startsWith("--phased ")
-      autopilot = true
-      phasedAutopilot = isPhased
-      skipGenericPush = true
+      try {
+        const isPhased = arg.startsWith("--phased ")
+        autopilot = true
+        phasedAutopilot = isPhased
+        skipGenericPush = true
 
-      // Include any inline task arg as staging context for goal derivation,
-      // but don't push it as a raw message — the kick-off message below replaces it.
-      const stagedArg = isPhased ? arg.slice("--phased ".length).trim() : arg
-      const stagingMessages: Message[] = stagedArg && stagedArg !== "on"
-        ? [...messages, { role: "user", content: stagedArg }]
-        : messages
+        // Include any inline task arg as staging context for goal derivation,
+        // but don't push it as a raw message — the kick-off message below replaces it.
+        const stagedArg = isPhased ? arg.slice("--phased ".length).trim() : arg
+        const stagingMessages: Message[] = stagedArg && stagedArg !== "on"
+          ? [...messages, { role: "user", content: stagedArg }]
+          : messages
 
-      process.stdout.write(`${COLORS.dim}deriving goal…${COLORS.reset}\r`)
-      const derived = await deriveGoal(currentModel, stagingMessages, goal)
-      goal = derived
-      await saveGoal(derived)
+        process.stdout.write(`${COLORS.dim}deriving goal…${COLORS.reset}\r`)
+        const derived = await deriveGoal(currentModel, stagingMessages, goal)
+        goal = derived
+        await saveGoal(derived)
 
-      // Inject MANDATORY goal block into system prompt
-      messages[0].content = messages[0].content.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
-      messages[0].content += buildGoalBlock(derived)
+        // Inject MANDATORY goal block into system prompt
+        messages[0].content = messages[0].content.replace(/\n\n## GOAL \(mandatory[\s\S]*$/, "")
+        messages[0].content += buildGoalBlock(derived)
 
-      const objectiveN = (await loadAutopilotCount()) + 1
-      await saveAutopilotCount(objectiveN)
+        const objectiveN = (await loadAutopilotCount()) + 1
+        await saveAutopilotCount(objectiveN)
 
-      const preview = derived.length > 80 ? derived.slice(0, 80) + "…" : derived
-      process.stdout.write("                              \r")
-      // Display format mirrors GitHub Copilot's cloud agent "● Started" indicator
-      console.log(`copilot: ${COLORS.green}●${COLORS.reset} Started autopilot objective #${objectiveN}: ${preview}`)
+        const preview = derived.length > 80 ? derived.slice(0, 80) + "…" : derived
+        process.stdout.write("                              \r")
+        // Display format mirrors GitHub Copilot's cloud agent "● Started" indicator
+        console.log(`copilot: ${COLORS.green}●${COLORS.reset} Started autopilot objective #${objectiveN}: ${preview}`)
 
-      // Kick-off message anchors the agent to the refined goal from turn 1
-      messages.push({
-        role: "user",
-        content: `[autopilot] Objective #${objectiveN}: ${derived}\nWork toward this goal autonomously. Use tools.${isPhased ? " Start in EXPLORE phase. Read relevant files first, avoid WriteFile until you fully understand needed changes, then call phase_advance with a summary to enter repair phase." : ""} Provide evidence (command output, file contents, test results) when done. Call autopilot_exit only when the goal is fully achieved and verified.`,
-      })
-      // fall through into the agent loop below by NOT continuing
+        // Kick-off message anchors the agent to the refined goal from turn 1
+        messages.push({
+          role: "user",
+          content: `[autopilot] Objective #${objectiveN}: ${derived}\nWork toward this goal autonomously. Use tools.${isPhased ? " Start in EXPLORE phase. Read relevant files first, avoid WriteFile until you fully understand needed changes, then call phase_advance with a summary to enter repair phase." : ""} Provide evidence (command output, file contents, test results) when done. Call autopilot_exit only when the goal is fully achieved and verified.`,
+        })
+        // fall through into the agent loop below by NOT continuing
+      } catch (err: unknown) {
+        autopilot = false
+        phasedAutopilot = false
+        process.stdout.write("                              \r")
+        console.log(`⚠ /autopilot failed: ${err instanceof Error ? err.message : String(err)}`)
+        continue
+      }
     }
 
     // Per-turn git context refresh: inject lightweight git state before each LLM call
@@ -2562,10 +2576,15 @@ Start with PHASE 1 now.`
     //   5. turnAbort.signal.aborted — user pressed Esc/Ctrl+C
     supervise: while (true) {
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-        if (estimateTokens(messages) > COMPACT_THRESHOLD) {
-          const before = estimateTokens(messages)
-          if (await compactMessages(currentModel, messages, turnAbort.signal))
-            console.log(`\n♻️  ${COLORS.cyan}auto-compacted${COLORS.reset} ${COLORS.dim}${before} → ${estimateTokens(messages)} est. tokens (kept system + last ${TAIL_TURNS} turns)${COLORS.reset}`)
+        try {
+          if (estimateTokens(messages) > COMPACT_THRESHOLD) {
+            const before = estimateTokens(messages)
+            if (await compactMessages(currentModel, messages, turnAbort.signal))
+              console.log(`\n♻️  ${COLORS.cyan}auto-compacted${COLORS.reset} ${COLORS.dim}${before} → ${estimateTokens(messages)} est. tokens (kept system + last ${TAIL_TURNS} turns)${COLORS.reset}`)
+          }
+        } catch (compactErr) {
+          if (turnAbort.signal.aborted) break
+          console.error(`${COLORS.dim}⚠ compaction failed: ${compactErr instanceof Error ? compactErr.message : String(compactErr)} — continuing${COLORS.reset}`)
         }
 
         try {
@@ -2725,6 +2744,8 @@ Start with PHASE 1 now.`
       messages.push({ role: "user", content: nudge })
     }
 
+    autopilot = false
+    phasedAutopilot = false
     process.off("SIGINT", sigintHandler)
     if (isTTY) {
       try { process.stdin.setRawMode(false) } catch {}
