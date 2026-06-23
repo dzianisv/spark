@@ -1113,203 +1113,17 @@ function makeLoadSkill(skillMap: Map<string, string>): Tool {
 }
 
 // ── Parallel Task Registry ────────────────────────────────────────────────────
-//
-// Research: how GitHub Copilot CLI, opencode, and Claude Code implement parallel
-// subagents and mid-run message passing — and how spark maps to each pattern.
-//
-// ┌─────────────────────────────────────────────────────────────────────────────┐
-// │ 1. GITHUB COPILOT CLI                                                       │
-// │    (the process running spark — /fleet /tasks /sidekicks /subagents)        │
-// └─────────────────────────────────────────────────────────────────────────────┘
-//
-// Spawn (non-blocking, background):
-//   task(name, prompt, agent_type, mode:"background")
-//   → returns agent_id immediately; agent runs concurrently on the JS event loop
-//   → agent_type selects a named specialist: "explore", "general-purpose",
-//     "rubber-duck", "code-review", "security-review", or custom agents under
-//     ~/.agents/ (e.g. "gsd-code-reviewer", "gsd-executor", "gsd-planner")
-//
-// Await result:
-//   read_agent(agent_id, wait:true, timeout?)
-//   → blocks until the agent's current turn completes; returns full turn history
-//   → read_agent(agent_id, since_turn:N) for delta reads (only turns after N)
-//   → called automatically when the completion notification arrives
-//
-// Mid-run message injection (= task_steer equivalent):
-//   write_agent(agent_id, message)
-//   → delivers message as a new user turn to a running OR idle background agent
-//   → if agent is running: queued, delivered after the current turn completes
-//   → if agent is idle: wakes the agent to process the message as a new turn
-//   → supports full multi-turn back-and-forth: write → wait → write again
-//   → confirmed: used in this session for research refinement and follow-up
-//
-// List/enumerate:
-//   list_agents(include_completed?)
-//   → all active and completed background agents; status and agent_id
-//   → statuses: running, idle, completed, failed, cancelled
-//   → "(steerable)" = accepts write_agent; "(one-shot)" = read-only
-//
-// Completion notification:
-//   → automatic event-driven notification when a background agent finishes
-//   → no polling needed; notification arrives as the next agent turn
-//   → pattern: launch → do independent work → wait for notification → read_agent
-//
-// Parallel pattern (used throughout this session):
-//   task(A, mode:"background") → id_A    // start agent A
-//   task(B, mode:"background") → id_B    // start agent B concurrently
-//   // do independent work while both run …
-//   read_agent(id_A, wait:true)           // collect A
-//   read_agent(id_B, wait:true)           // collect B
-//
-// /fleet  — enables parallel subagent execution mode (auto-fans out work)
-// /tasks  — view and manage running subagents and shell commands
-//
-// Agent statefulness:
-//   → agents retain full conversation history across write_agent turns
-//   → idle agents (done with last turn) re-engage on the next write_agent
-//
-// ┌─────────────────────────────────────────────────────────────────────────────┐
-// │ 2. OPENCODE                                                                  │
-// │    (packages/opencode/src/tool/task.ts + task-interrupt.ts + interrupt.ts)  │
-// └─────────────────────────────────────────────────────────────────────────────┘
-//
-// Spawn:
-//   Task({ description, prompt, subagent_type, directory?, task_id? })
-//   → creates child Session with parentID; runs via ops.prompt() (Effect fiber)
-//   → returns task_id (session UUID) in the tool result string
-//   → task_id passed back to Task() resumes the prior session (stateful)
-//   → subagent_type: "general", "explore", "scout", or user-defined agents
-//
-// Parallel (session/prompt.ts:1561, workflow/index.ts:405):
-//   Effect.forEach(subtasks, handleSubtask, { concurrency: 16 })
-//   → up to 16 parallel Effect fibers per turn
-//   → workflow ctx.parallel(tasks, { concurrencyLimit? }) — worker pool via
-//     withConcurrency(): shared queue drained by Promise.all of N workers
-//
-// Mid-run injection — task_steer (task-interrupt.ts):
-//   task_steer({ task_id, reason })
-//   → Interrupt.request({ sessionID, intent:"steer", reason, origin:"parent" })
-//   → writes to pending Map<SessionID, Pending> (in-memory shared singleton)
-//   → cancel beats steer: if cancel already queued, steer is silently dropped
-//   → child calls Interrupt.consume(sessionID) at EVERY turn start
-//   → steer → injects renderSteer(reason) as user msg, then continues normally
-//   → renderSteer: <steer>\n<reason>…</reason>\n</steer>
-//
-// Graceful cancel — task_cancel:
-//   → Interrupt.request(intent:"cancel") → renderCancel injected
-//   → child gets CANCEL_GRACE_TURNS=2 turns to wrap up before forced stop
-//   → renderCancel: <cancel>\n<reason>…</reason>\n</cancel>
-//
-// Hard abort — task_abort:
-//   → Interrupt.abortChild() → Effect interrupt (no grace, immediate kill)
-//
-// Completion notification (session/status.ts):
-//   → session.idle Bus event fires when child transitions to idle status
-//   → plugin event handler: event.type === "session.idle" → runSupervisor()
-//   → waitForResponse() polling fallback: 2s interval, checks time.completed
-//
-// ┌─────────────────────────────────────────────────────────────────────────────┐
-// │ 3. CLAUDE CODE — agents-supervisor                                          │
-// │    (agents-supervisor/core/assessment.mjs, bin/on-stop.mjs)                │
-// └─────────────────────────────────────────────────────────────────────────────┘
-//
-// Spawn:
-//   CC native Task() tool — creates a child context window for the subagent
-//   → no task_id / no resume; each Task call is a fresh context
-//   → subagent inherits core tools; Task itself excluded (no recursive spawning)
-//
-// Parallel:
-//   Caller launches multiple subagent Promise chains simultaneously (Promise.all)
-//   → no concurrency limit; all chains run on the JS event loop
-//   → supervisor itself is strictly sequential: activeSupervisors Set<string>
-//     ensures only one supervisor loop runs per session at a time
-//
-// Mid-run injection / completion:
-//   → Stop hook: CC calls bin/on-stop.mjs synchronously on EVERY agent stop
-//   → hook writes JSON to stdout:
-//       { decision:"block", reason:"<feedback>" }  → CC injects as user turn
-//       { decision:"proceed" }                     → agent allowed to stop
-//   → stop_hook_active guard prevents infinite hook loops
-//   → OpenCode variant: supervisor uses client.session.promptAsync() over HTTP
-//   → no real-time steering; supervisor only acts AFTER the agent stops
-//
-// ┌─────────────────────────────────────────────────────────────────────────────┐
-// │ 4. GITHUB COPILOT CLOUD AGENT                                               │
-// │    (docs.github.com/en/copilot/concepts/agents/cloud-agent)                │
-// └─────────────────────────────────────────────────────────────────────────────┘
-//
-//   → Runs in GitHub Actions ephemeral VM; task IS the session (1 issue = 1 job)
-//   → No Task() tool; no in-session subagent spawning
-//   → Parallelism at session level only: multiple issues → multiple Actions jobs
-//   → Mid-run injection: human types in GitHub chat UI; not agent-programmable
-//   → Automations: trigger-based (cron / issue-opened / PR-opened); sequential
-//
-// ┌─────────────────────────────────────────────────────────────────────────────┐
-// │ 5. COMPARISON                                                               │
-// └─────────────────────────────────────────────────────────────────────────────┘
-//
-//  Dimension        │ Copilot CLI          │ opencode             │ CC agents-sup     │ spark
-// ──────────────────┼──────────────────────┼──────────────────────┼───────────────────┼──────────────────
-//  Spawn API        │ task(agent_type,      │ Task({subagent_type, │ Task() native     │ Task({description,
-//                   │   mode:"background") │   task_id?,...})     │   (no resume)     │   prompt})
-//  Parallel         │ JS event loop;        │ Effect.forEach       │ Promise.all       │ Promise.all via
-//                   │   /fleet mode        │   concurrency:16     │   (no limit)      │   TaskWait
-//  Mid-run inject   │ write_agent(id, msg) │ task_steer →         │ Stop hook stdout  │ TaskSteer →
-//                   │   (running or idle)  │   Interrupt.Service  │   {block, reason} │   steerQueue
-//  Await result     │ read_agent(id,        │ ops.prompt() await   │ Promise.then      │ TaskWait([ids])
-//                   │   wait:true)         │   + session.idle evt │   inline          │   Promise.all
-//  Cancel           │ write_agent("stop…") │ task_cancel →        │ n/a (hook stops)  │ TaskCancel →
-//                   │                      │   CANCEL_GRACE=2     │                   │   cancelReason
-//  Notify           │ auto event-driven    │ session.idle Bus     │ CC calls hook     │ Promise resolve
-//  Resume session   │ write_agent wakes    │ task_id param        │ no                │ no
-//                   │   idle agent         │   reuses session     │                   │
-//
-// ┌─────────────────────────────────────────────────────────────────────────────┐
-// │ 6. SPARK IMPLEMENTATION CHOICES                                             │
-// └─────────────────────────────────────────────────────────────────────────────┘
-//
-//   - Task() fires a background subagent Promise; returns task_id immediately
-//   - TaskWait([ids]) runs Promise.all → N agents run concurrently
-//   - TaskSteer(id, msg) pushes to steerQueue; consumed at each turn boundary
-//   - TaskCancel(id, reason) sets cancelReason; agent gets ≤CANCEL_GRACE_TURNS
-//   - Interrupt XML format (<steer>, <cancel>) mirrors opencode's interrupt.ts
-//   - CANCEL_GRACE_TURNS=2 matches opencode's constant exactly
-//   - No resume: local Ollama sessions are cheap; just spawn a fresh Task
-//   - No Effect fibers or Bus events: JS Promise + Map is sufficient for Ollama
 
 export interface SubAgentHandle {
   id: string
   description: string
-  promise: Promise<string>        // resolves when agent completes
-  steerQueue: string[]            // messages to inject at next turn boundary
-  cancelReason: string | null     // set → graceful cancel in ≤CANCEL_GRACE_TURNS turns
+  promise: Promise<string>
   status: "running" | "done" | "cancelled" | "failed"
-  abort: AbortController          // for timeout and hard-abort
+  abort: AbortController
 }
 
 // Module-level registry — shared across all makeTaskTools() calls in a session
 export const taskRegistry = new Map<string, SubAgentHandle>()
-
-// Render helpers matching opencode's interrupt.ts format
-function renderSteer(reason: string): string {
-  return [
-    "<steer>",
-    "A course correction from your orchestrator. Adjust your approach accordingly, then continue your task.",
-    `<reason>${reason}</reason>`,
-    "</steer>",
-  ].join("\n")
-}
-
-function renderCancel(reason: string): string {
-  return [
-    "<cancel>",
-    "Your orchestrator is stopping this task. Wrap up now: briefly summarise what you completed and what remains, then stop. Do not start new work.",
-    `<reason>${reason}</reason>`,
-    "</cancel>",
-  ].join("\n")
-}
-
-const CANCEL_GRACE_TURNS = 2
 
 export function makeTaskTools(
   model: string,
@@ -1318,7 +1132,7 @@ export function makeTaskTools(
   chatFn: typeof ollamaChat = ollamaChat,  // injectable for deterministic tests
 ): Tool[] {
   // Sub-agent tools: everything EXCEPT Task-family (no recursive spawning)
-  const taskNames = new Set(["Task", "TaskWait", "TaskSteer", "TaskCancel"])
+  const taskNames = new Set(["Task", "TaskWait"])
   const subTools = tools.filter(t => !taskNames.has(t.definition.function.name))
   const toolDefs = subTools.map(t => t.definition)
   const toolMap = new Map(subTools.map(t => [t.definition.function.name, t]))
@@ -1332,25 +1146,9 @@ export function makeTaskTools(
       { role: "user", content: prompt },
     ]
     let lastContent = ""
-    let cancelInjected = false
-    let graceRemaining = 0
 
     try {
       for (let turn = 0; turn < MAX_TURNS; turn++) {
-        // 1. Inject cancel once (highest priority) — mirrors opencode CANCEL_GRACE_TURNS
-        if (handle.cancelReason !== null && !cancelInjected) {
-          subMessages.push({ role: "user", content: renderCancel(handle.cancelReason) })
-          cancelInjected = true
-          graceRemaining = CANCEL_GRACE_TURNS
-          handle.steerQueue.length = 0  // cancel beats steer: drop pending steers (opencode semantics)
-        }
-
-        // 2. Consume steer — skip during cancel wind-down (opencode: cancel drops pending steers)
-        if (!cancelInjected) {
-          const steer = handle.steerQueue.shift()
-          if (steer) subMessages.push({ role: "user", content: renderSteer(steer) })
-        }
-
         const reply = await chatFn(model, subMessages, toolDefs, undefined, undefined, handle.abort.signal)
         subMessages.push(reply)
         lastContent = reply.content
@@ -1366,32 +1164,18 @@ export function makeTaskTools(
           subMessages.push({ role: "tool", content: result, tool_name: call.function.name, tool_call_id: call.id })
         }
         if (handle.abort.signal.aborted) break
-
-        // Decrement grace AFTER the LLM call + tool execution so agent gets exactly
-        // CANCEL_GRACE_TURNS full turns to wrap up (not CANCEL_GRACE_TURNS - 1)
-        if (graceRemaining > 0) {
-          graceRemaining--
-          if (graceRemaining === 0) break
-        }
       }
     } catch (err: unknown) {
-      // The only caller of handle.abort.abort() is the timeout handler, which also
-      // sets handle.cancelReason. Once the shared AbortController trips, every
-      // subsequent chatFn call throws immediately, so the grace-turn / cancel
-      // injection path can never run after a timeout. Report it as a graceful
-      // "cancelled" with the timeout reason rather than a generic failure with a
-      // cryptic AbortError string.
       if (handle.abort.signal.aborted) {
         if (handle.status === "running") handle.status = "cancelled"
-        return truncateOutput(handle.cancelReason ?? lastContent)
+        return truncateOutput(lastContent)
       }
       const msg = err instanceof Error ? err.message : String(err)
       if (handle.status === "running") handle.status = "failed"
       return `Error: ${msg}`
     }
 
-    // Only overwrite status if still running — don't clobber "cancelled"/"failed"
-    if (handle.status === "running") handle.status = cancelInjected ? "cancelled" : "done"
+    if (handle.status === "running") handle.status = "done"
     return truncateOutput(lastContent)
   }
 
@@ -1426,9 +1210,7 @@ export function makeTaskTools(
       const handle: SubAgentHandle = {
         id,
         description: desc,
-        promise: Promise.resolve(""),  // placeholder; replaced below
-        steerQueue: [],
-        cancelReason: null,
+        promise: Promise.resolve(""),
         status: "running",
         abort: new AbortController(),
       }
@@ -1438,7 +1220,7 @@ export function makeTaskTools(
       // catch in runSubAgent reports it as "cancelled" using cancelReason.
       const timeoutId = setTimeout(() => {
         if (handle.status === "running") {
-          handle.cancelReason = `Timed out after ${timeout}ms`
+          handle.status = "cancelled"
           handle.abort.abort()
         }
       }, timeout)
@@ -1504,73 +1286,7 @@ export function makeTaskTools(
     },
   }
 
-  // ── TaskSteer: inject course correction at next turn boundary ─────────────
-  // Mirrors opencode task_steer → Interrupt.request(intent:"steer") →
-  // renderSteer() injected as user message at child's next turn start.
-  const taskSteerTool: Tool = {
-    definition: {
-      type: "function",
-      function: {
-        name: "TaskSteer",
-        description:
-          "Send a course correction to a running background task. The message is injected at the task's next turn boundary. " +
-          "Use when the task is headed in the wrong direction but you don't want to cancel it. (Mirrors opencode task_steer.)",
-        parameters: {
-          type: "object",
-          properties: {
-            task_id: { type: "string", description: "task_id of the running task to steer" },
-            message: { type: "string", description: "Course-correction instruction for the subagent" },
-          },
-          required: ["task_id", "message"],
-          additionalProperties: false,
-        },
-      },
-    },
-    async execute(args) {
-      const id = String(args.task_id)
-      const message = String(args.message)
-      const handle = taskRegistry.get(id)
-      if (!handle) return `Error: no task with id '${id}'`
-      if (handle.status !== "running") return `Task ${id} is already ${handle.status}; nothing to steer.`
-      handle.steerQueue.push(message)
-      return `Steer delivered to task ${id} ("${handle.description}"). Will apply at next turn boundary.`
-    },
-  }
-
-  // ── TaskCancel: graceful stop in ≤CANCEL_GRACE_TURNS turns ───────────────
-  // Mirrors opencode task_cancel → Interrupt.request(intent:"cancel") →
-  // renderCancel() injected → child wraps up in CANCEL_GRACE_TURNS=2 turns.
-  const taskCancelTool: Tool = {
-    definition: {
-      type: "function",
-      function: {
-        name: "TaskCancel",
-        description:
-          "Request graceful cancellation of a running background task. The task gets up to 2 turns to wrap up and summarise. " +
-          "The task_id remains in the registry; use TaskWait to collect its final summary. (Mirrors opencode task_cancel.)",
-        parameters: {
-          type: "object",
-          properties: {
-            task_id: { type: "string", description: "task_id of the running task to cancel" },
-            reason: { type: "string", description: "Why the task should stop" },
-          },
-          required: ["task_id", "reason"],
-          additionalProperties: false,
-        },
-      },
-    },
-    async execute(args) {
-      const id = String(args.task_id)
-      const reason = String(args.reason)
-      const handle = taskRegistry.get(id)
-      if (!handle) return `Error: no task with id '${id}'`
-      if (handle.status !== "running") return `Task ${id} is already ${handle.status}.`
-      handle.cancelReason = reason
-      return `Cancel delivered to task ${id} ("${handle.description}"). Will apply at next turn boundary (up to ${CANCEL_GRACE_TURNS} grace turns).`
-    },
-  }
-
-  return [taskTool, taskWaitTool, taskSteerTool, taskCancelTool]
+  return [taskTool, taskWaitTool]
 }
 
 // ── Autopilot ────────────────────────────────────────────────────────────────
@@ -1617,30 +1333,6 @@ export function makeAutopilotExit(state: { exited: boolean }): Tool {
   }
 }
 
-export function makePhaseAdvance(state: { phase: number }): Tool {
-  return {
-    definition: {
-      type: "function",
-      function: {
-        name: "phase_advance",
-        description:
-          "Advance from current phase to next in phased autopilot. Call this when you have fully explored codebase and understand changes needed.",
-        parameters: {
-          type: "object",
-          properties: {
-            summary: { type: "string", description: "Brief summary of what you learned in the exploration phase" },
-          },
-          required: ["summary"],
-          additionalProperties: false,
-        },
-      },
-    },
-    async execute(_args: Record<string, unknown>): Promise<string> {
-      state.phase++
-      return `Phase advanced to ${state.phase}. You are now in the repair phase — proceed with WriteFile edits and RunTests verification.`
-    },
-  }
-}
 // ── Skill Scanner ────────────────────────────────────────────────────────────
 
 async function scanSkills(): Promise<Map<string, string>> {
@@ -1840,7 +1532,7 @@ function buildSystemPrompt(agentInstructions: string, skillList: string, model: 
 - Prefer editing existing files over creating new ones.
 - If a task requires multiple independent tool calls, make them all at once.
 - Verify your work — run the code, check the output, confirm it works.
-- After patching code, call RunTests to verify correctness before declaring done.
+- After patching code, run the relevant test command (e.g. bun test, pytest, go test) to verify correctness before declaring done.
 
 ## Reasoning
 Before writing code or making decisions, think through the problem:
@@ -1957,78 +1649,6 @@ async function selectModel(models: string[], current: string, rl: ReturnType<typ
 }
 
 // ── Goal Supervisor ──────────────────────────────────────────────────────────
-//
-// DESIGN CONTEXT: how GitHub Copilot and Claude Code handle goal supervision,
-// and how spark.ts adapts those ideas for a local single-file Ollama agent.
-//
-// ┌─────────────────────────────────────────────────────────────────────────┐
-// │ GitHub Copilot Cloud Agent (docs.github.com/en/copilot/how-tos/use-    │
-// │ copilot-agents/cloud-agent)                                             │
-// │                                                                         │
-// │ Copilot has no "/goal" command. The task IS the goal — it comes from    │
-// │ an issue, chat message, PR comment, CLI prompt, or API call. Copilot   │
-// │ runs autonomously in a cloud sandbox, creates a branch, makes changes, │
-// │ and opens a PR. Completion is defined by: PR created + built-in code   │
-// │ review + security scan pass. There is no interactive judge loop —      │
-// │ the agent either finishes and ships a PR, or stalls and times out.     │
-// │                                                                         │
-// │ Key features:                                                           │
-// │ - Built-in Copilot code review (second-opinion on every PR)            │
-// │ - Security validation (hardcoded secrets, insecure deps)               │
-// │ - Automations: trigger on schedule or GitHub events (issue opened etc) │
-// │ - No explicit attempt cap exposed to user; cloud infra enforces limits  │
-// └─────────────────────────────────────────────────────────────────────────┘
-//
-// ┌─────────────────────────────────────────────────────────────────────────┐
-// │ Claude Code agents-supervisor plugin (github.com/dzianisv/             │
-// │ agents-supervisor — core/goal.mjs, opencode/supervisor-impl.ts)        │
-// │                                                                         │
-// │ 3 supervisor modes:                                                     │
-// │   reflection (default) — judge fires on every Stop hook, no goal       │
-// │   goal                 — /supervisor:goal <condition> sets explicit     │
-// │                          goal; judge checks it each turn               │
-// │   autopilot            — skip judge, always continue until budget gone  │
-// │                                                                         │
-// │ Goal state (per-session JSON, mode 0600):                               │
-// │   { condition, status, attempts, tokenBaseline, startedAt, deadline }   │
-// │   DEFAULT_MAX_ATTEMPTS = 16                                             │
-// │   DEFAULT_MAX_GOAL_DURATION_MS = 30 * 60 * 1000  (30 min deadline)     │
-// │                                                                         │
-// │ Goal injection (buildGoalRequirementSection):                           │
-// │   "## GOAL (mandatory completion requirement)"                          │
-// │   + evidence rule: "bare assertion does NOT count as evidence"          │
-// │                                                                         │
-// │ 2-stage judge:                                                          │
-// │   Stage 1: agent self-assessment JSON (status/stuck/missing/evidence)  │
-// │   Stage 2: external judge prompt validates the self-assessment          │
-// │                                                                         │
-// │ Escalating feedback (buildEscalatingFeedback):                          │
-// │   - Planning loop detected (read-only tools, no writes) → hard STOP    │
-// │   - Action loop detected (same commands repeated) → change approach    │
-// │   - Normal: gentle → missing/next_actions list → stuck warning         │
-// │                                                                         │
-// │ Antipatterns mined from 227 real agent stops (78% premature):          │
-// │   PERMISSION-SEEKING, STOPPED-WITH-TODOS, VERIFICATION-DEFERRAL,       │
-// │   FALSE-COMPLETE                                                        │
-// └─────────────────────────────────────────────────────────────────────────┘
-//
-// ┌─────────────────────────────────────────────────────────────────────────┐
-// │ spark.ts — simplified adaptation for local Ollama                      │
-// │                                                                         │
-// │ 2 states instead of 3 modes:                                            │
-// │   goal string (null = off)  — set via /goal or synthesised by LLM      │
-// │   autopilot bool            — extends tool budget to 200 rounds,       │
-// │                               adds autopilot_exit tool                 │
-// │                                                                         │
-// │ Key differences from CC:                                                │
-// │ - No deadline (30-min wall would kill long Ollama tasks)               │
-// │ - No self-assessment stage (adds a full LLM round per check)           │
-// │ - No per-session JSON (single .agents/spark/goal file, plain text)     │
-// │ - deriveGoal(): LLM synthesises goal from conversation — CC requires   │
-// │   the user to write the condition manually                             │
-// │ - Bounded check cap: interactive=5, autopilot=50 (CC default: 16)      │
-// │ - "copilot: ● Started autopilot objective #N" display format           │
-// └─────────────────────────────────────────────────────────────────────────┘
 
 /**
  * Injects the active goal into the system prompt as a MANDATORY completion
@@ -2351,7 +1971,6 @@ async function main() {
   let goal: string | null = await loadGoal()
   if (goal) setGoalBlock(goal)
   let autopilot = false
-  let phasedAutopilot = false
   let alwaysAutopilot = true
   let goalIsExplicit = false
 
@@ -2404,24 +2023,6 @@ async function main() {
     }
   }
 
-  // Open $EDITOR on a temp file and return its contents.
-  // Rejects if the editor exits non-zero (cancelled) or cannot be spawned.
-  const openEditor = (): Promise<string> =>
-    new Promise((res, rej) => {
-      const tmp = join(homedir(), `.spark_edit_${Date.now()}.txt`)
-      const editor = process.env.EDITOR ?? process.env.VISUAL ?? "vi"
-      const child = spawn(editor, [tmp], { stdio: "inherit" })
-      let errored = false
-      child.on("error", (err) => { errored = true; rej(err) })
-      child.on("close", (code) => {
-        if (errored) return // error event already rejected
-        if (code !== 0) return rej(new Error(`editor exited ${code}`))
-        readFile(tmp, "utf8")
-          .then((t) => unlink(tmp).catch(() => {}).then(() => res(t.trim())))
-          .catch(rej)
-      })
-    })
-
   // Exit cleanly on Ctrl+C when waiting at the prompt (no agent turn active).
   const promptSigint = () => { process.stdout.write("\n"); rl.close(); process.exit(0) }
 
@@ -2442,7 +2043,6 @@ async function main() {
     if (trimmed === "/clear") {
       messages.length = 1 // keep system prompt
       autopilot = false
-      phasedAutopilot = false
       console.log(`${COLORS.dim}Conversation cleared.${COLORS.reset}\n`)
       continue
     }
@@ -2490,27 +2090,7 @@ async function main() {
       continue
     }
 
-    // /goal — user-defined completion condition
-    //
-    // How it compares to CC and Copilot:
-    //
-    //   GitHub Copilot: no /goal command — task IS the goal, set when
-    //     the session starts (from issue, chat message, API call).
-    //
-    //   Claude Code (/supervisor:goal <condition>):
-    //     - Stores goal in .supervisor/goals/<sessionId>.json (mode 0600)
-    //     - Fields: condition, status, attempts, tokenBaseline, startedAt, deadline
-    //     - Goal mode raises retry cap to DEFAULT_MAX_ATTEMPTS (16) and adds
-    //       a 30-min hard deadline
-    //     - Injects condition via buildGoalRequirementSection() into judge prompt
-    //     - /supervisor:goal clear|stop|off|reset|none|cancel all clear it
-    //
-    //   spark (/goal <text> | /goal clear):
-    //     - Stores in .agents/spark/goal (plain text, loads on startup)
-    //     - No deadline; bounded check cap (interactive=5, autopilot=50)
-    //     - Injects via buildGoalBlock() into system prompt — replaces any
-    //       prior block via regex strip so set/update/clear is idempotent
-    //     - Also pushes a user message anchoring the model to the goal
+    // /goal — set or clear the completion goal
     if (trimmed.startsWith("/goal ")) {
       const arg = trimmed.slice("/goal ".length).trim()
       if (arg === "clear") {
@@ -2544,116 +2124,36 @@ async function main() {
     }
 
     if (trimmed === "/autopilot") {
-      console.log(autopilot ? `autopilot: ON` : `autopilot: OFF`)
+      console.log(`always-autopilot: ${alwaysAutopilot ? "ON" : "OFF"} | current turn: ${autopilot ? "ON" : "OFF"}`)
       continue
     }
 
     let skipGenericPush = false
 
-    if (trimmed === "/edit") {
-      let edited: string
-      try {
-        edited = await openEditor()
-      } catch {
-        console.log(`${COLORS.dim}editor failed or cancelled${COLORS.reset}`)
-        continue
-      }
-      if (!edited) { console.log(`${COLORS.dim}(empty, skipped)${COLORS.reset}`); continue }
-      messages.push({ role: "user", content: edited })
-      skipGenericPush = true
-      // fall through to agent loop
-    }
-
     // /autopilot — autonomous goal-driven loop
-    //
-    // How it compares to CC and Copilot:
-    //
-    //   GitHub Copilot: the cloud agent IS always in "autopilot" — it receives
-    //     a task, runs fully autonomously in a cloud VM, and exits by creating
-    //     a PR. No explicit on/off toggle needed; the whole system is async.
-    //     Output: "copilot: ● Started <task>" in the GitHub UI.
-    //
-    //   Claude Code autopilot mode (/supervisor autopilot or /supervisor:mode autopilot):
-    //     - Sets state.mode = 'autopilot', state.autopilot = true
-    //     - In autopilot mode the supervisor SKIPS the judge and always continues
-    //       (the opposite of spark — CC autopilot means "never stop")
-    //     - Uses the heartbeat Stop-hook pattern from agents-supervisor:
-    //       on each idle, a fresh sub-agent is launched with TASK + LATEST_REPLY
-    //       and decides DONE | CONTINUE independently of the live session
-    //
-    //   spark (/autopilot <task> | /autopilot on | /autopilot off):
-    //     - Uses the same judge loop as /goal, not CC's skip-judge autopilot
-    //     - Key addition: LLM derives the goal first (deriveGoal()), so the
-    //       user doesn't need to write a precise condition
-    //     - Prints "copilot: ● Started autopilot objective #N: <preview>"
-    //       (format borrowed from GitHub Copilot's cloud UI indicator)
-    //     - Increases tool round budget to 200 (vs 30 for interactive)
-    //     - Increases judge check cap to 50 (vs 5 for interactive)
-    //     - autopilot_exit tool lets the agent signal it's done and triggers
-    //       an AUTOPILOT_SUMMARY_PROMPT for a completion summary
-    //
-    // Ref: ~/workspace/agents-supervisor/SKILL.md (autopilot heartbeat)
-    //      ~/workspace/blogposts/claude-code-stop-hook-reflection-judge.md
-    if (trimmed.startsWith("/repro ")) {
-      const issueDesc = trimmed.slice("/repro ".length).trim()
-      if (!issueDesc) { console.log(`Usage: /repro <issue description>`); continue }
-
-      autopilot = true
-      // Set a concrete goal so the supervisor judges this run correctly,
-      // not against any stale goal from a previous /goal or /autopilot.
-      goal = `Issue reproduced by a failing script, root cause fixed, repro script now passes, and RunTests passes. Issue: ${issueDesc}`
-      await saveGoal(goal)
-      setGoalBlock(goal)
-      const reproPrompt = `You are in issue-reproduce-fix-verify mode for this issue:
-
-ISSUE: ${issueDesc}
-
-Work in EXACTLY this sequence — do not skip steps:
-
-PHASE 1 — REPRODUCE:
-1. Understand the issue from the description and codebase context.
-2. Write a minimal reproduction script (repro.sh or repro.ts/repro.py) that demonstrates the bug.
-3. Run it. If it does NOT fail/show the bug, revise and retry until it reliably reproduces the issue.
-4. When the repro script reliably fails, print: "REPRO CONFIRMED: <what it shows>"
-
-PHASE 2 — FIX:
-5. Locate the root cause in the codebase.
-6. Apply the fix.
-7. Run the repro script again. If it STILL fails, revise the fix and retry.
-8. When the repro script passes, print: "FIX VERIFIED"
-
-PHASE 3 — REGRESSION:
-9. Run RunTests to ensure existing tests still pass.
-10. If tests fail, fix them.
-11. Call autopilot_exit with a summary.
-
-Start with PHASE 1 now.`
-
-      messages.push({ role: "user", content: reproPrompt })
-      skipGenericPush = true
-      console.log(`${COLORS.cyan}repro mode ON — issue: ${issueDesc}${COLORS.reset}`)
-      // fall through into agent loop
-    }
     if (trimmed.startsWith("/autopilot ")) {
       const arg = trimmed.slice("/autopilot ".length).trim()
       if (arg === "off") {
         autopilot = false
-        phasedAutopilot = false
         alwaysAutopilot = false
         console.log(`autopilot OFF`)
         continue
       }
 
+      if (arg === "on") {
+        alwaysAutopilot = true
+        console.log(`autopilot ON (always-on mode)`)
+        continue
+      }
+
       try {
-        const isPhased = arg.startsWith("--phased ")
         autopilot = true
-        phasedAutopilot = isPhased
         alwaysAutopilot = true
         skipGenericPush = true
 
         // Include any inline task arg as staging context for goal derivation,
         // but don't push it as a raw message — the kick-off message below replaces it.
-        const stagedArg = isPhased ? arg.slice("--phased ".length).trim() : arg
+        const stagedArg = arg
         const stagingMessages: Message[] = stagedArg && stagedArg !== "on"
           ? [...messages, { role: "user", content: stagedArg }]
           : messages
@@ -2676,12 +2176,11 @@ Start with PHASE 1 now.`
         // Kick-off message anchors the agent to the refined goal from turn 1
         messages.push({
           role: "user",
-          content: `[autopilot] Objective #${objectiveN}: ${derived}\nWork toward this goal autonomously. Use tools.${isPhased ? " Start in EXPLORE phase. Read relevant files first, avoid WriteFile until you fully understand needed changes, then call phase_advance with a summary to enter repair phase." : ""} Provide evidence (command output, file contents, test results) when done. Call autopilot_exit only when the goal is fully achieved and verified.`,
+          content: `[autopilot] Objective #${objectiveN}: ${derived}\nWork toward this goal autonomously. Use tools. Provide evidence (command output, file contents, test results) when done. Call autopilot_exit only when the goal is fully achieved and verified.`,
         })
         // fall through into the agent loop below by NOT continuing
       } catch (err: unknown) {
         autopilot = false
-        phasedAutopilot = false
         process.stdout.write("                              \r")
         console.log(`⚠ /autopilot failed: ${err instanceof Error ? err.message : String(err)}`)
         continue
@@ -2740,11 +2239,7 @@ Start with PHASE 1 now.`
     // Agent loop: call model, handle tool calls, repeat until text response
     const tools = buildTools()
     const autopilotState = { exited: false, summarized: false }
-    const phaseState = { phase: 1 }
     if (autopilot) tools.push(makeAutopilotExit(autopilotState))
-    if (phasedAutopilot) {
-      tools.push(makePhaseAdvance(phaseState))
-    }
     let reflections = 0
     const toolDefsForCall = tools.map((t) => t.definition)
     const toolMap = new Map(tools.map((t) => [t.definition.function.name, t]))
@@ -2760,7 +2255,7 @@ Start with PHASE 1 now.`
     const abortTurn = () => {
       turnAbort.abort()
       for (const h of taskRegistry.values()) {
-        if (h.status === "running") { h.cancelReason ??= "User interrupted"; h.abort.abort() }
+        if (h.status === "running") { h.abort.abort() }
       }
     }
     const sigintHandler = () => {
@@ -2815,6 +2310,7 @@ Start with PHASE 1 now.`
     //   4. checkGoal throws — Ollama error, stop safely
     //   5. turnAbort.signal.aborted — user pressed Esc/Ctrl+C
     supervise: while (true) {
+      recentToolCalls.length = 0  // reset doom-loop detector each supervisor cycle
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
         try {
           if (estimateTokens(messages) > COMPACT_THRESHOLD) {
@@ -2946,7 +2442,6 @@ Start with PHASE 1 now.`
           if (autopilotState.exited && !autopilotState.summarized) {
             autopilotState.summarized = true
             autopilot = false // exit returns to normal mode (blog: switch to build); re-arm with /autopilot
-            phasedAutopilot = false
             messages.push({ role: "user", content: AUTOPILOT_SUMMARY_PROMPT })
           }
         } catch (err: unknown) {
@@ -2985,7 +2480,6 @@ Start with PHASE 1 now.`
     }
 
     autopilot = false
-    phasedAutopilot = false
     // Re-arm autopilot for the next turn; clear derived goal so next message gets a fresh one
     if (alwaysAutopilot && !goalIsExplicit) {
       goal = null

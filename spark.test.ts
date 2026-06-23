@@ -358,7 +358,7 @@ Working directory: ${process.cwd()}`
     execute: (args: Record<string, unknown>) => executeToolCall("Bash", args),
   }
 
-  // Real task tools (Task, TaskWait, TaskSteer, TaskCancel) backed by real Ollama
+  // Real task tools (Task, TaskWait) backed by real Ollama
   const realTaskTools = makeTaskTools(model, systemPrompt, [subAgentBash] as any)
   const realTaskToolMap = new Map(realTaskTools.map(t => [t.definition.function.name, t]))
 
@@ -1489,10 +1489,10 @@ describe("Task parallel system", () => {
     return tools.map(t => ({ ...t, name: t.definition.function.name }))
   }
 
-  test("makeTaskTools — returns 4 tools with correct names", () => {
+  test("makeTaskTools — returns 2 tools with correct names", () => {
     const tools = makeTaskTools(stubModel, stubSystemPrompt, stubTools)
     const names = tools.map(t => t.definition.function.name)
-    expect(names).toEqual(["Task", "TaskWait", "TaskSteer", "TaskCancel"])
+    expect(names).toEqual(["Task", "TaskWait"])
   })
 
   test("TaskWait — empty array returns error", async () => {
@@ -1501,22 +1501,6 @@ describe("Task parallel system", () => {
     const result = await TaskWait.execute({ task_ids: [] })
     expect(result).toContain("Error")
     expect(result).toContain("non-empty")
-  })
-
-  test("TaskSteer — unknown task_id returns error", async () => {
-    const tools = getTaskTools()
-    const TaskSteer = tools.find(t => t.name === "TaskSteer")!
-    const result = await TaskSteer.execute({ task_id: "nonexistent-id-xyz", message: "change approach" })
-    expect(result).toContain("Error")
-    expect(result).toContain("nonexistent-id-xyz")
-  })
-
-  test("TaskCancel — unknown task_id returns error", async () => {
-    const tools = getTaskTools()
-    const TaskCancel = tools.find(t => t.name === "TaskCancel")!
-    const result = await TaskCancel.execute({ task_id: "nonexistent-id-abc", reason: "stop it" })
-    expect(result).toContain("Error")
-    expect(result).toContain("nonexistent-id-abc")
   })
 
   test("TaskWait — unknown task_id returns not found message", async () => {
