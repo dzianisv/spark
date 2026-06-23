@@ -1,0 +1,39 @@
+#!/bin/sh
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+IMAGE="spark-sandbox"
+
+# Build only if image doesn't exist locally
+if ! docker image inspect "$IMAGE" > /dev/null 2>&1; then
+  echo "[sandbox] Building $IMAGE (first time, may take a few minutes)..."
+  docker build -t "$IMAGE" "$SCRIPT_DIR"
+else
+  echo "[sandbox] Using cached $IMAGE image (run 'docker rmi $IMAGE' to rebuild)"
+fi
+
+# Spark script location
+SPARK_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Rewrite localhost → host.docker.internal for Docker networking
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+DOCKER_OLLAMA_URL="$(echo "$OLLAMA_URL" | sed 's/localhost/host.docker.internal/g; s/127\.0\.0\.1/host.docker.internal/g')"
+
+# Build volume mounts
+VOL_ARGS="-v $(pwd):/workspace -v $SPARK_DIR:/spark"
+
+# Spark entry point
+SPARK_CMD="bun /spark/spark.ts"
+
+# Extra env vars
+EXTRA_ENV="-e OLLAMA_URL=$DOCKER_OLLAMA_URL -e SPARK_SANDBOX=1"
+[ -n "$CHATGPT_ACCESS_TOKEN" ] && EXTRA_ENV="$EXTRA_ENV -e CHATGPT_ACCESS_TOKEN=$CHATGPT_ACCESS_TOKEN"
+[ -n "$SPARK_API_URL" ] && EXTRA_ENV="$EXTRA_ENV -e SPARK_API_URL=$SPARK_API_URL -e SPARK_API_KEY=${SPARK_API_KEY:-}"
+
+# shellcheck disable=SC2086
+exec docker run --rm -it \
+  --add-host=host.docker.internal:host-gateway \
+  $EXTRA_ENV \
+  $VOL_ARGS \
+  -w /workspace \
+  "$IMAGE" $SPARK_CMD
