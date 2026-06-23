@@ -109,8 +109,21 @@ async function ollamaChatRaw(
   think: boolean,
   signal?: AbortSignal,
 ): Promise<Message> {
-  const body: Record<string, unknown> = { model, messages, tools, stream: true }
-  if (think) body.think = true
+  // Strip thinking field from history messages before sending — Qwen3 best-practice:
+  // "historical model output should only include the final output part and does not
+  // need to include the thinking content." Avoids wasting context on re-sent traces.
+  const serializedMessages = messages.map(m =>
+    m.thinking ? { ...m, thinking: undefined } : m
+  )
+  const body: Record<string, unknown> = { model, messages: serializedMessages, tools, stream: true }
+  if (think) {
+    body.think = true
+    // num_ctx: Qwen3 needs 32,768+ tokens of output room for its think block.
+    // Ollama's default is 2048 which silently truncates reasoning mid-thought.
+    const numCtx = Number(process.env.SPARK_NUM_CTX) || 32768
+    // Qwen3 recommended sampling for thinking mode: DO NOT use greedy (temp=0).
+    body.options = { num_ctx: numCtx, temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0 }
+  }
   if (format) { body.format = format; body.options = { temperature: 0 } }
   const res = await fetch(`${getOllamaUrl()}/api/chat`, {
     method: "POST",
