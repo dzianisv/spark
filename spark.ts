@@ -2124,7 +2124,7 @@ async function main() {
   // Try saved model first, fall back to auto-pick
   const savedModel = await loadSavedModel()
   let currentModel: string
-  let thinkingEnabled = false
+  let thinkingEnabled: boolean | undefined = undefined  // undefined = auto (on for capable models)
   if (savedModel && models.includes(savedModel)) {
     currentModel = savedModel
     console.log(`${COLORS.dim}Restored saved model: ${savedModel}${COLORS.reset}`)
@@ -2280,12 +2280,15 @@ async function main() {
       const arg = trimmed.slice("/think".length).trim()
       if (arg === "on" || arg === "1" || arg === "true") {
         thinkingEnabled = true
-        console.log(`Thinking mode ON — model will use extended reasoning (slower)`)
-      } else if (arg === "off" || arg === "0" || arg === "false" || arg === "") {
+        console.log(`Thinking mode ON — forced on`)
+      } else if (arg === "off" || arg === "0" || arg === "false") {
         thinkingEnabled = false
-        console.log(`Thinking mode OFF`)
+        console.log(`Thinking mode OFF — forced off`)
+      } else if (arg === "auto" || arg === "") {
+        thinkingEnabled = undefined
+        console.log(`Thinking mode AUTO — enabled for capable models (default)`)
       } else {
-        console.log(`Usage: /think on|off`)
+        console.log(`Usage: /think on|off|auto`)
       }
       continue
     }
